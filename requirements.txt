@@ -1,0 +1,5 @@
+mujoco-warp==3.6.0
+mediapy==1.2.6
+torch
+tensorboard
+warp-lang
