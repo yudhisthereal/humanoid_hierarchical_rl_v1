@@ -77,6 +77,7 @@
 
   <worldbody>
     <light mode="targetbodycom" target="body_link" pos="4 0 1"/>
+    <camera name="track_com" mode="trackcom" pos="0 -2.5 1.0" xyaxes="1 0 0 0 0 1"/>
     <body name="body_link" pos="0 0 0.3">
       <inertial pos="-0.01501 0.00013 0.06582" quat="0.704708 0.704003 0.0667707 -0.0575246" mass="1.34928" diaginertia="0.00341264 0.00316574 0.00296931"/>
       <freejoint/>

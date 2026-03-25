@@ -10,7 +10,8 @@ def main() -> None:
 	parser = argparse.ArgumentParser()
 	sub = parser.add_subparsers(dest="mode", required=True)
 
-	sub.add_parser("train")
+	train_parser = sub.add_parser("train")
+	train_parser.add_argument("--env", choices=["selector", "executor"], default="executor")
 
 	test_parser = sub.add_parser("test")
 	test_parser.add_argument("--checkpoint", type=str, required=True)
@@ -18,7 +19,7 @@ def main() -> None:
 
 	args = parser.parse_args()
 	if args.mode == "train":
-		train()
+		train(args.env)
 	else:
 		run_test(args.checkpoint, args.steps)
 

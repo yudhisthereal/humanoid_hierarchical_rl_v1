@@ -15,6 +15,7 @@ class StrategyAction(IntEnum):
 
 class StrategySelectorEnv:
     def __init__(self, num_envs: int = 4096, episode_length: int = 5, device: str = "cuda"):
+        wp.init()
         self.num_envs = num_envs
         self.episode_length = episode_length
         self.device = torch.device(device)
