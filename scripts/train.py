@@ -105,18 +105,21 @@ def _add_scalar_with_all_axes(
 	writer.add_scalar(f"{name}/by_iteration", value, iteration)
 
 
-def train_strategy_selector() -> None:
+def train_strategy_selector(best_state_tracking: str = "reward") -> None:
 	global _progress_started
 	CONSECUTIVE_SUCCESS_THRES = 100
 	_progress_started = False
+	if best_state_tracking not in ["reward", "success_rate"]:
+		raise ValueError(f"best_state_tracking must be 'reward' or 'success_rate', got '{best_state_tracking}'")
 	if not torch.cuda.is_available():
 		raise RuntimeError("CUDA is required. CPU fallback is disabled.")
 
 	device = "cuda"
+	print(f"Training strategy selector with best_state_tracking={best_state_tracking}")
 	project_root = PROJECT_ROOT
 	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-	num_envs = 4096
+	num_envs = 12_000
 	horizon = 5
 	max_episode_timesteps = 100
 
@@ -251,8 +254,14 @@ def train_strategy_selector() -> None:
 			# Update entropy schedule based on success rate
 			agent._update_schedules(total_env_steps, success_rate=latest_success_rate)
 
-			# Save best state using reward only
-			if current_mean_reward > best_mean_reward:
+			# Save best state based on configured tracking method
+			should_save = False
+			if best_state_tracking == "reward":
+				should_save = current_mean_reward > best_mean_reward
+			elif best_state_tracking == "success_rate":
+				should_save = latest_success_rate > best_success_rate
+			
+			if should_save:
 				best_success_rate = latest_success_rate
 				best_mean_reward = current_mean_reward
 				best_model_state = copy.deepcopy(agent.model.state_dict())
@@ -320,19 +329,22 @@ def train_strategy_selector() -> None:
 		writer.close()
 
 
-def train_goal_executor() -> None:
+def train_goal_executor(best_state_tracking: str = "reward") -> None:
 	global _progress_started
 	_progress_started = False
 	CONSECUTIVE_SUCCESS_THRES = 100
+	if best_state_tracking not in ["reward", "success_rate"]:
+		raise ValueError(f"best_state_tracking must be 'reward' or 'success_rate', got '{best_state_tracking}'")
 	if not torch.cuda.is_available():
 		raise RuntimeError("CUDA is required. CPU fallback is disabled.")
 
 	device = "cuda"
+	print(f"Training goal executor with best_state_tracking={best_state_tracking}")
 	project_root = PROJECT_ROOT
 	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 	model_xml = project_root / "assets" / "humanoid_2d" / "humanoid_2d.xml"
 
-	num_envs = 4096
+	num_envs = 12_000
 	horizon = 100
 	max_episode_timesteps = 7000
 
@@ -503,8 +515,14 @@ def train_goal_executor() -> None:
 			timesteps += num_envs * horizon
 			max_consecutive_successes = max(max_consecutive_successes, consecutive_successes)
 
-			# Save best state using reward only
-			if current_mean_reward > best_mean_reward:
+			# Save best state based on configured tracking method
+			should_save = False
+			if best_state_tracking == "reward":
+				should_save = current_mean_reward > best_mean_reward
+			elif best_state_tracking == "success_rate":
+				should_save = latest_success_rate > best_success_rate
+			
+			if should_save:
 				best_success_rate = latest_success_rate
 				best_mean_reward = current_mean_reward
 				best_model_state = copy.deepcopy(agent.model.state_dict())
@@ -588,12 +606,14 @@ def train_goal_executor() -> None:
 		writer.close()
 
 
-def train(target_env: Literal["selector", "executor"] = "executor") -> None:
+def train(target_env: Literal["selector", "executor"] = "executor", best_state_tracking: str = "reward") -> None:
+	if best_state_tracking not in ["reward", "success_rate"]:
+		raise ValueError(f"best_state_tracking must be 'reward' or 'success_rate', got '{best_state_tracking}'")
 	if target_env == "selector":
-		train_strategy_selector()
+		train_strategy_selector(best_state_tracking=best_state_tracking)
 		return
 	if target_env == "executor":
-		train_goal_executor()
+		train_goal_executor(best_state_tracking=best_state_tracking)
 		return
 	raise ValueError(f"Unknown training target: {target_env}")
 

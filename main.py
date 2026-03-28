@@ -12,6 +12,7 @@ def main() -> None:
 
 	train_parser = sub.add_parser("train")
 	train_parser.add_argument("--env", choices=["selector", "executor"], default="executor")
+	train_parser.add_argument("--state_tracking", choices=["reward", "success"], default="reward")
 
 	test_parser = sub.add_parser("test")
 	test_parser.add_argument("--checkpoint", type=str, required=True)
@@ -19,7 +20,9 @@ def main() -> None:
 
 	args = parser.parse_args()
 	if args.mode == "train":
-		train(args.env)
+		# Convert "success" to "success_rate" for the train function
+		state_tracking = "success_rate" if args.state_tracking == "success" else args.state_tracking
+		train(args.env, best_state_tracking=state_tracking)
 	else:
 		run_test(args.checkpoint, args.steps)
 
