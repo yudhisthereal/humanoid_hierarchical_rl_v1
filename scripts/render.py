@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.ppo.ppo import PPOAgent, PPOConfig
-from envs.goal_conditioned import GoalConditionedExecutorEnv
+from envs.goal_conditioned import GoalConditionedExecutorEnv, GoalId
 from envs.strategy_selector import StrategySelectorEnv
 
 
@@ -41,10 +41,10 @@ def _resolve_render_size(model: mujoco.MjModel, width: int, height: int) -> tupl
 	return max(1, min(width, offwidth)), max(1, min(height, offheight))
 
 
-def _build_agent(env_name: str, action_dim: int, device: str, checkpoint: str | None) -> PPOAgent:
+def _build_agent(env_name: str, obs_dim: int, action_dim: int, device: str, checkpoint: str | None) -> PPOAgent:
 	if env_name == "executor":
 		cfg = PPOConfig(
-			obs_dim=2,
+			obs_dim=obs_dim,
 			action_dim=action_dim,
 			minibatch_size=128,
 			is_discrete=False,
@@ -52,7 +52,7 @@ def _build_agent(env_name: str, action_dim: int, device: str, checkpoint: str | 
 		)
 	else:
 		cfg = PPOConfig(
-			obs_dim=1,
+			obs_dim=obs_dim,
 			action_dim=3,
 			minibatch_size=128,
 			is_discrete=True,
@@ -131,6 +131,19 @@ def _disable_perturbation_safely(env: GoalConditionedExecutorEnv | StrategySelec
 		LOGGER.exception("[%s] Failed to disable perturbation: %s", env_name, exc)
 
 
+def _override_push_force_safely(
+	env: GoalConditionedExecutorEnv | StrategySelectorEnv,
+	env_name: str,
+	push_force: float | None,
+) -> None:
+	if push_force is None:
+		return
+	try:
+		env.push_force.fill_(float(push_force))
+	except Exception as exc:
+		LOGGER.exception("[%s] Failed to override push force: %s", env_name, exc)
+
+
 def _policy_action_or_zero(
 	agent: PPOAgent | None,
 	obs: torch.Tensor,
@@ -160,6 +173,8 @@ def render_episode(
 	fps: int = 30,
 	no_perturb: bool = False,
 	no_control: bool = False,
+	goal: str | None = None,
+	push_force: float | None = None,
 ) -> Path:
 	if not torch.cuda.is_available():
 		raise RuntimeError("CUDA is required. CPU fallback is disabled.")
@@ -178,6 +193,15 @@ def render_episode(
 			episode_length=max(1, timesteps),
 			device=device,
 		)
+		# Set goal if specified
+		if goal is not None:
+			goal_upper = goal.upper()
+			if goal_upper == "BRACE":
+				env.goal_id[0] = GoalId.BRACE
+			elif goal_upper == "ROLL":
+				env.goal_id[0] = GoalId.ROLL
+			else:
+				raise ValueError(f"Invalid goal: {goal}. Must be 'brace' or 'roll'.")
 		resolved_ckpt = _resolve_checkpoint("executor", checkpoint)
 		random_control = (resolved_ckpt is None) and (not no_control)
 		act_joint_ids = env.mj_model.actuator_trnid[:, 0].astype(np.int64)
@@ -186,7 +210,7 @@ def render_episode(
 		if no_control:
 			agent = None
 		else:
-			agent = _build_agent("executor", env.action_dim, device, resolved_ckpt)
+			agent = _build_agent("executor", env.obs_torch.shape[1], env.action_dim, device, resolved_ckpt)
 			if random_control:
 				_tqdm_write("[INFO] [executor] No checkpoint provided. Using exploratory random control for visible joint motion.")
 
@@ -198,7 +222,10 @@ def render_episode(
 			obs = env.reset()
 			if no_perturb:
 				_disable_perturbation_safely(env, env_name)
+				if push_force is not None:
+					_tqdm_write("[INFO] [executor] --push-force is ignored because --no-perturb is enabled.")
 			else:
+				_override_push_force_safely(env, env_name, push_force)
 				_tqdm_write(
 					f"[INFO] [{env_name}] Initial push: force={float(env.push_force[0].item()):.2f} "
 					f"steps={int(env.push_steps_left[0].item())}"
@@ -223,12 +250,9 @@ def render_episode(
 
 			with torch.no_grad():
 				for step_idx in _tqdm_range(max(1, timesteps), "Rendering executor"):
-					# Build observation from mjData (official MuJoCo state).
-					obs = torch.tensor(
-						[[float(env.mj_data.qvel[env._rootx_qvel_idx]), float(env.mj_data.qvel[env._rooty_qvel_idx])]],
-						device=device,
-						dtype=torch.float32,
-					)
+					# Use the actual environment observation
+					obs = env.obs_torch[:1].clone()
+					
 					if random_control:
 						action = torch.empty((1, env.action_dim), device=device, dtype=torch.float32).uniform_(-1.0, 1.0)
 					else:
@@ -255,6 +279,16 @@ def render_episode(
 
 					for _ in range(frame_skip):
 						mujoco.mj_step(env.mj_model, env.mj_data)
+
+					# Refresh observation buffer from simulation state
+					env._refresh_state_from_sim()
+					env.obs_torch[0, 0] = env.vx[0]
+					env.obs_torch[0, 1] = env.omega[0]
+					env.obs_torch[0, 2] = env.rotation[0]
+					env.obs_torch[0, 3] = env.com_z[0]
+					env.obs_torch[0, 4] = env.head_z[0]
+					env.obs_torch[0, 5] = env.waist_angle[0]
+					env.obs_torch[0, 6] = env.knees_angle[0]
 
 					if step_idx % 100 == 0:
 						act_qvel_abs = float(np.mean(np.abs(env.mj_data.qvel[act_joint_ids])))
@@ -294,11 +328,15 @@ def render_episode(
 		if no_control:
 			agent = None
 		else:
-			agent = _build_agent("selector", action_dim=3, device=device, checkpoint=resolved_ckpt)
+			agent = _build_agent("selector", 1, action_dim=3, device=device, checkpoint=resolved_ckpt)
 		frames: list[np.ndarray] = []
 		obs = env.reset()
 		if no_perturb:
 			_disable_perturbation_safely(env, env_name)
+			if push_force is not None:
+				_tqdm_write("[INFO] [selector] --push-force is ignored because --no-perturb is enabled.")
+		else:
+			_override_push_force_safely(env, env_name, push_force)
 
 		with torch.no_grad():
 			for step_idx in _tqdm_range(max(1, timesteps), "Rendering selector"):
@@ -333,6 +371,8 @@ def render_episode(
 					obs = env.reset(out["done"])
 					if no_perturb:
 						_disable_perturbation_safely(env, env_name)
+					else:
+						_override_push_force_safely(env, env_name, push_force)
 		try:
 			media.write_video(str(out_path), frames, fps=fps)
 		except Exception as exc:
@@ -352,6 +392,10 @@ def main() -> None:
 	parser.add_argument("--fps", type=int, default=30)
 	parser.add_argument("--no-perturb", action="store_true")
 	parser.add_argument("--no-control", action="store_true")
+	parser.add_argument("--goal", type=str, choices=["brace", "roll"], default=None,
+					   help="Goal for executor environment (brace or roll). Only used when --env executor.")
+	parser.add_argument("--push-force", type=float, default=None,
+					   help="Fixed perturbation force to apply (ignored with --no-perturb).")
 	args = parser.parse_args()
 
 	video_path = render_episode(
@@ -362,6 +406,8 @@ def main() -> None:
 		fps=args.fps,
 		no_perturb=args.no_perturb,
 		no_control=args.no_control,
+		goal=args.goal,
+		push_force=args.push_force,
 	)
 	print(f"Saved video: {video_path}")
 

@@ -74,6 +74,38 @@ Start TensorBoard:
 tensorboard --logdir report/tensorboard
 ```
 
+### Plot all executor reward components in one plot (no retraining)
+
+If you already have saved TensorBoard logs and want all reward components for a goal in one chart:
+
+```bash
+python scripts/add_tb_custom_scalars.py --run latest --goal both
+tensorboard --logdir report/tensorboard
+```
+
+Then open TensorBoard **Custom Scalars** tab:
+
+- `Goal BRACE -> Reward Components`
+- `Goal ROLL -> Reward Components`
+
+This only appends chart layout metadata to existing runs; it does **not** require re-running training.
+
+If you want explicit legend labels and clearly different colors (saved PNG plots), run:
+
+```bash
+python scripts/plot_reward_components.py --run latest --goal both --window-size 7
+```
+
+Outputs are written to:
+
+- `report/plots/goal_executor/<run>/brace_components.png`
+- `report/plots/goal_executor/<run>/roll_components.png`
+
+The same script also creates paired trend plots for the tracked training metrics:
+
+- `report/plots/goal_executor/<run>/mean_reward_pair.png`
+- `report/plots/goal_executor/<run>/win_rate_pair.png`
+
 ### Checkpoints
 
 - Selector: `report/checkpoints/strategy_selector`
@@ -132,11 +164,9 @@ Core metrics include:
 - `consecutive_successes`
 - `max_consecutive_successes`
 
-Metrics are logged on three x-axis variants:
+Metrics are logged on one x-axis variant:
 
 - `.../by_iteration`
-- `.../by_episode`
-- `.../by_timestep`
 
 ---
 

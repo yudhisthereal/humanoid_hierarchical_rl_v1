@@ -99,8 +99,6 @@ def _add_scalar_with_all_axes(
 	name: str,
 	value: torch.Tensor | float,
 	iteration: int,
-	episodes: int,
-	timesteps: int,
 ) -> None:
 	writer.add_scalar(f"{name}/by_iteration", value, iteration)
 
@@ -297,18 +295,20 @@ def train_strategy_selector(best_state_tracking: str = "reward") -> None:
 				float(loss_dict["entropy_coef"]),
 			)
 
-			_add_scalar_with_all_axes(writer, "selector/mean_reward", current_mean_reward, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "selector/policy_loss", loss_dict["policy_loss"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "selector/value_loss", loss_dict["value_loss"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "selector/entropy", loss_dict["entropy"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "selector/entropy_coef", loss_dict["entropy_coef"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "selector/learning_rate", loss_dict["learning_rate"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "selector/approx_kl", loss_dict["approx_kl"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "selector/current_mean_reward", current_mean_reward, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "selector/best_mean_reward", best_mean_reward, iteration, episodes, timesteps)
+			_add_scalar_with_all_axes(writer, "selector/mean_reward", current_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "selector/policy_loss", loss_dict["policy_loss"], iteration)
+			_add_scalar_with_all_axes(writer, "selector/value_loss", loss_dict["value_loss"], iteration)
+			_add_scalar_with_all_axes(writer, "selector/entropy", loss_dict["entropy"], iteration)
+			_add_scalar_with_all_axes(writer, "selector/entropy_coef", loss_dict["entropy_coef"], iteration)
+			_add_scalar_with_all_axes(writer, "selector/learning_rate", loss_dict["learning_rate"], iteration)
+			_add_scalar_with_all_axes(writer, "selector/approx_kl", loss_dict["approx_kl"], iteration)
+			_add_scalar_with_all_axes(writer, "selector/current_mean_reward", current_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "selector/best_mean_reward", best_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "selector/success_rate", latest_success_rate, iteration)
+			_add_scalar_with_all_axes(writer, "selector/max_success_rate", max_success_rate, iteration)
 
-			_add_scalar_with_all_axes(writer, "train/consecutive_successes", consecutive_successes, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/max_consecutive_successes", max_consecutive_successes, iteration, episodes, timesteps)
+			_add_scalar_with_all_axes(writer, "train/consecutive_successes", consecutive_successes, iteration)
+			_add_scalar_with_all_axes(writer, "train/max_consecutive_successes", max_consecutive_successes, iteration)
 
 			if iteration % 1000 == 0:
 				ckpt_path = ckpt_dir / f"ppo_iter_{iteration}.pt"
@@ -558,34 +558,63 @@ def train_goal_executor(best_state_tracking: str = "reward") -> None:
 				float(loss_dict["entropy_coef"]),
 			)
 
-			_add_scalar_with_all_axes(writer, "train/mean_reward", current_mean_reward, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/policy_loss", loss_dict["policy_loss"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/value_loss", loss_dict["value_loss"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/entropy", loss_dict["entropy"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/entropy_coef", loss_dict["entropy_coef"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/learning_rate", loss_dict["learning_rate"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/approx_kl", loss_dict["approx_kl"], iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/current_mean_reward", current_mean_reward, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/best_mean_reward", best_mean_reward, iteration, episodes, timesteps)
+			_add_scalar_with_all_axes(writer, "train/mean_reward", current_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "train/policy_loss", loss_dict["policy_loss"], iteration)
+			_add_scalar_with_all_axes(writer, "train/value_loss", loss_dict["value_loss"], iteration)
+			_add_scalar_with_all_axes(writer, "train/entropy", loss_dict["entropy"], iteration)
+			_add_scalar_with_all_axes(writer, "train/entropy_coef", loss_dict["entropy_coef"], iteration)
+			_add_scalar_with_all_axes(writer, "train/learning_rate", loss_dict["learning_rate"], iteration)
+			_add_scalar_with_all_axes(writer, "train/approx_kl", loss_dict["approx_kl"], iteration)
+			_add_scalar_with_all_axes(writer, "train/current_mean_reward", current_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "train/current_mean_reward_per_step", current_mean_reward / float(horizon), iteration)
+			_add_scalar_with_all_axes(writer, "train/best_mean_reward", best_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "train/success_rate", latest_success_rate, iteration)
+			_add_scalar_with_all_axes(writer, "train/max_success_rate", max_success_rate, iteration)
 
 			brace_den = torch.clamp(brace_count, min=1.0)
 			roll_den = torch.clamp(roll_count, min=1.0)
 
-			_add_scalar_with_all_axes(writer, "Goal BRACE/total_reward", brace_reward_total / brace_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal BRACE/r_arm_first", brace_arm_first / brace_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal BRACE/r_arm_sync", brace_arm_sync / brace_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal BRACE/r_knee_timing", brace_knee_timing / brace_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal BRACE/c_head_impact", brace_head_impact / brace_den, iteration, episodes, timesteps)
+			brace_total_avg = brace_reward_total / brace_den
+			brace_r_arm_first_avg = brace_arm_first / brace_den
+			brace_r_arm_sync_avg = brace_arm_sync / brace_den
+			brace_r_knee_timing_avg = brace_knee_timing / brace_den
+			brace_c_head_impact_avg = brace_head_impact / brace_den
 
-			_add_scalar_with_all_axes(writer, "Goal ROLL/total_reward", roll_reward_total / roll_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal ROLL/r_vel", roll_r_vel / roll_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal ROLL/r_rot", roll_r_rot / roll_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal ROLL/r_tuck", roll_r_tuck / roll_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal ROLL/c_ctrl", roll_c_ctrl / roll_den, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "Goal ROLL/c_impact", roll_c_impact / roll_den, iteration, episodes, timesteps)
+			roll_total_avg = roll_reward_total / roll_den
+			roll_r_vel_avg = roll_r_vel / roll_den
+			roll_r_rot_avg = roll_r_rot / roll_den
+			roll_r_tuck_avg = roll_r_tuck / roll_den
+			roll_c_ctrl_avg = roll_c_ctrl / roll_den
+			roll_c_impact_avg = roll_c_impact / roll_den
 
-			_add_scalar_with_all_axes(writer, "train/consecutive_successes", consecutive_successes, iteration, episodes, timesteps)
-			_add_scalar_with_all_axes(writer, "train/max_consecutive_successes", max_consecutive_successes, iteration, episodes, timesteps)
+			# Weighted goal components (same scale/sign as contribution to total reward)
+			_add_scalar_with_all_axes(writer, "Goal BRACE/total_reward", brace_total_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal BRACE/r_arm_first", 1.0 * brace_r_arm_first_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal BRACE/r_arm_sync", 0.8 * brace_r_arm_sync_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal BRACE/r_knee_timing", 1.0 * brace_r_knee_timing_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal BRACE/c_head_impact", -1.0 * brace_c_head_impact_avg, iteration)
+
+			_add_scalar_with_all_axes(writer, "Goal ROLL/total_reward", roll_total_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/r_vel", 1.0 * roll_r_vel_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/r_rot", 1.0 * roll_r_rot_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/r_tuck", 0.5 * roll_r_tuck_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/c_ctrl", -0.5 * roll_c_ctrl_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/c_impact", -1.0 * roll_c_impact_avg, iteration)
+
+			# Raw (unweighted) goal components for diagnostics
+			_add_scalar_with_all_axes(writer, "Goal BRACE/raw/r_arm_first", brace_r_arm_first_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal BRACE/raw/r_arm_sync", brace_r_arm_sync_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal BRACE/raw/r_knee_timing", brace_r_knee_timing_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal BRACE/raw/c_head_impact", brace_c_head_impact_avg, iteration)
+
+			_add_scalar_with_all_axes(writer, "Goal ROLL/raw/r_vel", roll_r_vel_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/raw/r_rot", roll_r_rot_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/raw/r_tuck", roll_r_tuck_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/raw/c_ctrl", roll_c_ctrl_avg, iteration)
+			_add_scalar_with_all_axes(writer, "Goal ROLL/raw/c_impact", roll_c_impact_avg, iteration)
+
+			_add_scalar_with_all_axes(writer, "train/consecutive_successes", consecutive_successes, iteration)
+			_add_scalar_with_all_axes(writer, "train/max_consecutive_successes", max_consecutive_successes, iteration)
 
 			if iteration % 1000 == 0:
 				ckpt_path = ckpt_dir / f"ppo_iter_{iteration}.pt"

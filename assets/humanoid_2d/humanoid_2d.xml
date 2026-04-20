@@ -46,7 +46,7 @@
 
       <body name="upper_torso" pos="0 0 0.12">
         <joint axis="0 1 0" name="waist_joint" pos="0 0 -0.17" range="0 1.57" type="hinge"/>
-        <geom friction="0.9" name="upper_torso_geom" size="0.1 0.12" pos="0 0 0" type="capsule"/>
+        <geom friction="0.9" name="upper_torso_geom" size="0.3 0.12" pos="0 0 0" type="capsule"/>
         
         <geom name="head" pos="0 0 0.24" size="0.08" type="sphere" rgba="1 0 0 1"/>
 
