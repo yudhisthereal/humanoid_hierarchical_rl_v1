@@ -7,6 +7,7 @@ This repository contains a GPU-first reinforcement learning setup for humanoid f
 - Two separable training pipelines:
   - **Strategy Selector** (discrete action)
   - **Goal Executor** (continuous action)
+   - **Sanity Check** (continuous pose-tracking on `humanoid_2d_half.xml`)
 
 All rollout tensors are intended to remain on CUDA tensors during training.
 
@@ -18,6 +19,7 @@ All rollout tensors are intended to remain on CUDA tensors during training.
 - `agents/ppo/ppo.py` — PPO agent + policy/value model
 - `envs/strategy_selector/env.py` — strategy selector environment
 - `envs/goal_conditioned/env.py` — goal-conditioned executor environment
+- `envs/sanity_check/env.py` — sanity-check pose-tracking environment
 - `envs/robot_env.py` — wrapper env (kept for compatibility)
 - `scripts/train.py` — training pipelines (`selector` and `executor`)
 - `scripts/test.py` — inference test script
@@ -57,6 +59,12 @@ python main.py train --env executor
 
 ```bash
 python main.py test --checkpoint <path_to_checkpoint.pt> --steps 1000
+```
+
+### 4) Train Sanity Check (continuous PPO on half model)
+
+```bash
+python main.py train --env sanity_check
 ```
 
 ---

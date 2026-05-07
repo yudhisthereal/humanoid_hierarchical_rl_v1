@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from typing import Sequence
 
 import torch
 import warp as wp
@@ -15,7 +16,11 @@ from agents.ppo.ppo import PPOAgent, PPOConfig
 from envs.robot_env import RobotHierarchicalEnv
 
 
-def run_test(checkpoint: str, steps: int = 1000) -> None:
+def run_test(
+	checkpoint: str,
+	steps: int = 1000,
+	push_force_choices: Sequence[float] | None = None,
+) -> None:
 	if not torch.cuda.is_available():
 		raise RuntimeError("CUDA is required. CPU fallback is disabled.")
 
@@ -23,7 +28,12 @@ def run_test(checkpoint: str, steps: int = 1000) -> None:
 	project_root = PROJECT_ROOT
 	model_xml = project_root / "assets" / "humanoid_2d" / "humanoid_2d.xml"
 
-	env = RobotHierarchicalEnv(model_xml=str(model_xml), num_envs=4096, device=device)
+	env = RobotHierarchicalEnv(
+		model_xml=str(model_xml),
+		num_envs=4096,
+		device=device,
+		push_force_choices=push_force_choices,
+	)
 	cfg = PPOConfig(
 		obs_dim=env.obs_dim,
 		action_dim=env.action_dim,

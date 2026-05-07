@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Sequence
 
 import torch
 
@@ -14,17 +14,24 @@ class RobotHierarchicalEnv:
 		model_xml: str,
 		num_envs: int = 4096,
 		device: str = "cuda",
+		push_force_choices: Sequence[float] | None = None,
 	):
 		self.num_envs = num_envs
 		self.device = torch.device(device)
 
-		self.strategy_selector = StrategySelectorEnv(num_envs=num_envs, episode_length=5, device=device)
+		self.strategy_selector = StrategySelectorEnv(
+			num_envs=num_envs,
+			episode_length=5,
+			device=device,
+			push_values=push_force_choices,
+		)
 		self.goal_executor = GoalConditionedExecutorEnv(
 			model_xml=model_xml,
 			num_envs=num_envs,
 			dt=0.02,
 			episode_length=100,
 			device=device,
+			push_force_choices=push_force_choices,
 		)
 
 	@property

@@ -1,3 +1,4 @@
 plan/
 __pycache__/
 report/
+*.pth

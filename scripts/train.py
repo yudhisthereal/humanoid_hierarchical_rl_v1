@@ -5,7 +5,7 @@ from datetime import datetime
 import os
 from pathlib import Path
 import sys
-from typing import Literal
+from typing import Literal, Sequence
 
 import torch
 import warp as wp
@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from agents.ppo.ppo import PPOAgent, PPOConfig
 from envs.goal_conditioned import GoalConditionedExecutorEnv
 from envs.goal_conditioned import GoalId
+from envs.sanity_check import SanityCheckEnv
 from envs.strategy_selector import StrategySelectorEnv
 
 
@@ -103,7 +104,10 @@ def _add_scalar_with_all_axes(
 	writer.add_scalar(f"{name}/by_iteration", value, iteration)
 
 
-def train_strategy_selector(best_state_tracking: str = "reward") -> None:
+def train_strategy_selector(
+	best_state_tracking: str = "reward",
+	push_force_choices: Sequence[float] | None = None,
+) -> None:
 	global _progress_started
 	CONSECUTIVE_SUCCESS_THRES = 100
 	_progress_started = False
@@ -121,7 +125,12 @@ def train_strategy_selector(best_state_tracking: str = "reward") -> None:
 	horizon = 5
 	max_episode_timesteps = 100
 
-	env = StrategySelectorEnv(num_envs=num_envs, episode_length=max_episode_timesteps, device=device)
+	env = StrategySelectorEnv(
+		num_envs=num_envs,
+		episode_length=max_episode_timesteps,
+		device=device,
+		push_values=push_force_choices,
+	)
 
 	ppo_cfg = PPOConfig(
 		obs_dim=1,
@@ -278,6 +287,7 @@ def train_strategy_selector(best_state_tracking: str = "reward") -> None:
 				for group in agent.optimizer.param_groups:
 					group["lr"] = max(1e-6, group["lr"])
 				agent.cfg.entropy_coef = max(1e-5, agent.cfg.entropy_coef)
+				rollback_events += 1
 
 			_print_progress(
 				iteration,
@@ -329,7 +339,10 @@ def train_strategy_selector(best_state_tracking: str = "reward") -> None:
 		writer.close()
 
 
-def train_goal_executor(best_state_tracking: str = "reward") -> None:
+def train_goal_executor(
+	best_state_tracking: str = "reward",
+	push_force_choices: Sequence[float] | None = None,
+) -> None:
 	global _progress_started
 	_progress_started = False
 	CONSECUTIVE_SUCCESS_THRES = 100
@@ -348,7 +361,14 @@ def train_goal_executor(best_state_tracking: str = "reward") -> None:
 	horizon = 100
 	max_episode_timesteps = 7000
 
-	env = GoalConditionedExecutorEnv(model_xml=str(model_xml), num_envs=num_envs, dt=0.02, episode_length=max_episode_timesteps, device=device)
+	env = GoalConditionedExecutorEnv(
+		model_xml=str(model_xml),
+		num_envs=num_envs,
+		dt=0.02,
+		episode_length=max_episode_timesteps,
+		device=device,
+		push_force_choices=push_force_choices,
+	)
 
 	ppo_cfg = PPOConfig(
 		obs_dim=7,
@@ -635,14 +655,277 @@ def train_goal_executor(best_state_tracking: str = "reward") -> None:
 		writer.close()
 
 
-def train(target_env: Literal["selector", "executor"] = "executor", best_state_tracking: str = "reward") -> None:
+def train_sanity_check(best_state_tracking: str = "reward") -> None:
+	global _progress_started
+	_progress_started = False
+	CONSECUTIVE_SUCCESS_THRES = 100
+	USE_ROLLBACK = False
+	if best_state_tracking not in ["reward", "success_rate"]:
+		raise ValueError(f"best_state_tracking must be 'reward' or 'success_rate', got '{best_state_tracking}'")
+	if not torch.cuda.is_available():
+		raise RuntimeError("CUDA is required. CPU fallback is disabled.")
+
+	device = "cuda"
+	print(f"Training sanity_check with best_state_tracking={best_state_tracking}")
+	project_root = PROJECT_ROOT
+	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+	model_xml = project_root / "assets" / "humanoid_2d" / "humanoid_2d_half.xml"
+
+	num_envs = 4096
+	horizon = 32
+	max_episode_timesteps = 300
+
+	env = SanityCheckEnv(
+		model_xml=str(model_xml),
+		num_envs=num_envs,
+		dt=0.02,
+		episode_length=max_episode_timesteps,
+		device=device,
+	)
+
+	ppo_cfg = PPOConfig(
+		obs_dim=int(env.obs_torch.shape[1]),
+		action_dim=env.action_dim,
+		minibatch_size=256,
+		lr=3e-4,
+		entropy_coef_initial=0.02,
+		entropy_coef_final=0.002,
+		anneal_steps=200_000_000,
+		lr_final_factor=0.3,
+		kl_threshold=0.03,
+		is_discrete=False,
+		device=device,
+	)
+	agent = PPOAgent(ppo_cfg)
+
+	ckpt_dir = project_root / "report" / "checkpoints" / "sanity_check" / timestamp
+	ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+	log_dir = project_root / "report" / "tensorboard" / "sanity_check" / timestamp
+	log_dir.mkdir(parents=True, exist_ok=True)
+	writer = SummaryWriter(log_dir=str(log_dir))
+
+	iteration = 0
+	consecutive_successes = 0
+	max_consecutive_successes = 0
+	episodes = 0
+	timesteps = 0
+	max_mean_reward = float("-inf")
+	max_mean_reward_iteration = 0
+	max_success_rate = 0.0
+	max_success_rate_iteration = 0
+	best_success_rate = 0.0
+	best_mean_reward = float("-inf")
+	best_model_state: dict[str, torch.Tensor] | None = None
+	best_optimizer_state: dict | None = None
+	total_env_steps = 0
+	rollback_events = 0
+
+	obs = env.reset()
+
+	try:
+		while True:
+			obs_buf = []
+			actions_buf = []
+			logp_buf = []
+			values_buf = []
+			rewards_buf = []
+			dones_buf = []
+			done_count_iter = torch.zeros((), device=device)
+			success_done_count_iter = torch.zeros((), device=device)
+
+			err_total = torch.zeros((), device=device)
+			jit_total = torch.zeros((), device=device)
+
+			for _ in range(horizon):
+				assert obs.is_cuda
+				act = agent.act(obs)
+				next_step = env.step(act["action"])
+				assert next_step["obs"].is_cuda
+				assert next_step["reward"].is_cuda
+
+				obs_buf.append(obs.clone())
+				actions_buf.append(act["action"].clone())
+				logp_buf.append(act["log_prob"].clone())
+				values_buf.append(act["value"].clone())
+				rewards_buf.append(next_step["reward"].clone())
+				dones_buf.append(next_step["done"].float().clone())
+
+				done_mask = next_step["done"]
+				done_count_iter = done_count_iter + done_mask.float().sum()
+				success_done_count_iter = success_done_count_iter + (
+					(next_step["info"]["success"] & done_mask).float().sum()
+				)
+
+				err_total = err_total + next_step["info"]["err"].sum()
+				jit_total = jit_total + next_step["info"]["jit"].sum()
+
+				done = done_mask
+				obs = env.reset(done) if torch.any(done) else next_step["obs"]
+
+			with torch.no_grad():
+				last_value = agent.act(obs)["value"]
+
+			obs_t = torch.stack(obs_buf, dim=0)
+			actions_t = torch.stack(actions_buf, dim=0)
+			logp_t = torch.stack(logp_buf, dim=0)
+			values_t = torch.stack(values_buf, dim=0)
+			rewards_t = torch.stack(rewards_buf, dim=0)
+			dones_t = torch.stack(dones_buf, dim=0)
+
+			advantages, returns = agent.compute_gae(
+				rewards=rewards_t,
+				dones=dones_t,
+				values=values_t,
+				last_value=last_value,
+			)
+			assert advantages.is_cuda
+			total_env_steps += num_envs * horizon
+
+			loss_dict = agent.update(
+				obs=obs_t,
+				actions=actions_t,
+				old_log_probs=logp_t,
+				returns=returns,
+				advantages=advantages,
+				total_env_steps=total_env_steps,
+			)
+
+			iteration += 1
+
+			total_reward = rewards_t.sum()
+			current_mean_reward = float((total_reward / num_envs).item())
+			max_mean_reward = max(max_mean_reward, current_mean_reward)
+			if max_mean_reward == current_mean_reward:
+				max_mean_reward_iteration = iteration
+
+			completed_eps_iter = int(done_count_iter.item())
+			if completed_eps_iter > 0:
+				latest_success_rate = float((success_done_count_iter / done_count_iter).item())
+				consecutive_successes = consecutive_successes + 1 if latest_success_rate >= 0.95 else 0
+			else:
+				latest_success_rate = 0.0
+				consecutive_successes = 0
+
+			max_success_rate = max(max_success_rate, latest_success_rate)
+			if max_success_rate == latest_success_rate:
+				max_success_rate_iteration = iteration
+
+			episodes += int(dones_t.sum().item())
+			timesteps += num_envs * horizon
+			max_consecutive_successes = max(max_consecutive_successes, consecutive_successes)
+
+			agent._update_schedules(total_env_steps, success_rate=latest_success_rate)
+
+			should_save = False
+			if best_state_tracking == "reward":
+				should_save = current_mean_reward > best_mean_reward
+			elif best_state_tracking == "success_rate":
+				should_save = latest_success_rate > best_success_rate
+
+			if should_save:
+				best_success_rate = latest_success_rate
+				best_mean_reward = current_mean_reward
+				best_model_state = copy.deepcopy(agent.model.state_dict())
+				best_optimizer_state = copy.deepcopy(agent.optimizer.state_dict())
+
+			if (
+				USE_ROLLBACK
+				and
+				best_mean_reward > float("-inf")
+				and current_mean_reward < (best_mean_reward * 0.8)
+				and best_model_state is not None
+				and best_optimizer_state is not None
+			):
+				agent.model.load_state_dict(best_model_state)
+				agent.optimizer.load_state_dict(best_optimizer_state)
+				agent.apply_rollback_damping(success_rate=latest_success_rate)
+				for group in agent.optimizer.param_groups:
+					group["lr"] = max(1e-6, group["lr"])
+				agent.cfg.entropy_coef = max(1e-5, agent.cfg.entropy_coef)
+				rollback_events += 1
+
+			_print_progress(
+				iteration,
+				episodes,
+				timesteps,
+				completed_eps_iter,
+				current_mean_reward,
+				max_mean_reward,
+				max_mean_reward_iteration,
+				latest_success_rate,
+				max_success_rate,
+				max_success_rate_iteration,
+				consecutive_successes,
+				max_consecutive_successes,
+				float(loss_dict["entropy_coef"]),
+			)
+
+			# Mean per-step env-averaged components: sum over rollout then normalize by (N * H)
+			norm = float(num_envs * horizon)
+			err_avg = float((err_total / norm).item())
+			jit_avg = float((jit_total / norm).item())
+
+			_add_scalar_with_all_axes(writer, "sanity_check/mean_reward", current_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/policy_loss", loss_dict["policy_loss"], iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/value_loss", loss_dict["value_loss"], iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/entropy", loss_dict["entropy"], iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/entropy_coef", loss_dict["entropy_coef"], iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/learning_rate", loss_dict["learning_rate"], iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/approx_kl", loss_dict["approx_kl"], iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/grad_norm", loss_dict["grad_norm"], iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/n_updates", loss_dict["n_updates"], iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/current_mean_reward", current_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/best_mean_reward", best_mean_reward, iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/success_rate", latest_success_rate, iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/max_success_rate", max_success_rate, iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/err", err_avg, iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/jit", jit_avg, iteration)
+			_add_scalar_with_all_axes(writer, "sanity_check/rollback_events", rollback_events, iteration)
+
+			_add_scalar_with_all_axes(writer, "train/consecutive_successes", consecutive_successes, iteration)
+			_add_scalar_with_all_axes(writer, "train/max_consecutive_successes", max_consecutive_successes, iteration)
+
+			if iteration % 1000 == 0:
+				ckpt_path = ckpt_dir / f"ppo_iter_{iteration}.pt"
+				agent.save(str(ckpt_path), iteration)
+
+			if consecutive_successes >= CONSECUTIVE_SUCCESS_THRES:
+				final_ckpt = ckpt_dir / f"ppo_iter_{iteration}_final.pt"
+				agent.save(str(final_ckpt), iteration)
+				print()
+				break
+
+	except KeyboardInterrupt:
+		print()
+		interrupt_ckpt = ckpt_dir / f"ppo_iter_{iteration}_interrupt.pt"
+		agent.save(str(interrupt_ckpt), iteration)
+	finally:
+		writer.flush()
+		writer.close()
+
+
+def train(
+	target_env: Literal["selector", "executor", "sanity_check"] = "executor",
+	best_state_tracking: str = "reward",
+	push_force_choices: Sequence[float] | None = None,
+) -> None:
 	if best_state_tracking not in ["reward", "success_rate"]:
 		raise ValueError(f"best_state_tracking must be 'reward' or 'success_rate', got '{best_state_tracking}'")
 	if target_env == "selector":
-		train_strategy_selector(best_state_tracking=best_state_tracking)
+		train_strategy_selector(
+			best_state_tracking=best_state_tracking,
+			push_force_choices=push_force_choices,
+		)
 		return
 	if target_env == "executor":
-		train_goal_executor(best_state_tracking=best_state_tracking)
+		train_goal_executor(
+			best_state_tracking=best_state_tracking,
+			push_force_choices=push_force_choices,
+		)
+		return
+	if target_env == "sanity_check":
+		train_sanity_check(best_state_tracking=best_state_tracking)
 		return
 	raise ValueError(f"Unknown training target: {target_env}")
 

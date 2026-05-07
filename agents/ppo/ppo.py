@@ -251,6 +251,7 @@ class PPOAgent:
 		total_value_loss = torch.zeros((), device=self.device)
 		total_entropy = torch.zeros((), device=self.device)
 		total_approx_kl = torch.zeros((), device=self.device)
+		total_grad_norm = torch.zeros((), device=self.device)
 		n_updates = 0
 		stop_update = False
 		approx_kl = torch.zeros((), device=self.device)
@@ -296,7 +297,7 @@ class PPOAgent:
 				if has_bad_grad:
 					self.optimizer.zero_grad(set_to_none=True)
 					continue
-				nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm)
+				grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm)
 				self.optimizer.step()
 				with torch.no_grad():
 					for param in self.model.parameters():
@@ -307,6 +308,7 @@ class PPOAgent:
 				total_value_loss = total_value_loss + value_loss.detach()
 				total_entropy = total_entropy + entropy_loss.detach()
 				total_approx_kl = total_approx_kl + approx_kl.detach()
+				total_grad_norm = total_grad_norm + grad_norm.detach()
 				n_updates += 1
 
 			if stop_update:
@@ -320,6 +322,8 @@ class PPOAgent:
 			"value_loss": float((total_value_loss / denom).item()),
 			"entropy": float((total_entropy / denom).item()),
 			"approx_kl": self.current_approx_kl,
+			"grad_norm": float((total_grad_norm / denom).item()) if n_updates > 0 else 0.0,
+			"n_updates": float(n_updates),
 			"entropy_coef": float(self.current_entropy_coef),
 			"learning_rate": float(self.current_lr),
 		}

@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agents.ppo.ppo import PPOAgent, PPOConfig
 from envs.goal_conditioned import GoalConditionedExecutorEnv, GoalId
+from envs.sanity_check import SanityCheckEnv
 from envs.strategy_selector import StrategySelectorEnv
 
 
@@ -42,20 +43,20 @@ def _resolve_render_size(model: mujoco.MjModel, width: int, height: int) -> tupl
 
 
 def _build_agent(env_name: str, obs_dim: int, action_dim: int, device: str, checkpoint: str | None) -> PPOAgent:
-	if env_name == "executor":
-		cfg = PPOConfig(
-			obs_dim=obs_dim,
-			action_dim=action_dim,
-			minibatch_size=128,
-			is_discrete=False,
-			device=device,
-		)
-	else:
+	if env_name == "selector":
 		cfg = PPOConfig(
 			obs_dim=obs_dim,
 			action_dim=3,
 			minibatch_size=128,
 			is_discrete=True,
+			device=device,
+		)
+	else:
+		cfg = PPOConfig(
+			obs_dim=obs_dim,
+			action_dim=action_dim,
+			minibatch_size=128,
+			is_discrete=False,
 			device=device,
 		)
 
@@ -103,7 +104,111 @@ def _selector_frame(push_force: float, action: int, reward: float, success: bool
 	frame[h - 60 : h - 30, 60 : 60 + reward_w] = np.array([255, 220, 90], dtype=np.uint8)
 
 	return frame
-	
+
+
+def _load_single_env_module(env_name: str):
+	module_path = PROJECT_ROOT / "scripts" / env_name / f"{env_name}.py"
+	if not module_path.exists():
+		raise FileNotFoundError(f"Unable to find single-env module for {env_name}: {module_path}")
+
+	spec = importlib.util.spec_from_file_location(f"render_{env_name}", module_path)
+	if spec is None or spec.loader is None:
+		raise ImportError(f"Unable to load module spec for {env_name} from {module_path}")
+	module = importlib.util.module_from_spec(spec)
+	spec.loader.exec_module(module)
+	return module
+
+
+def _render_brace_single_episode(
+	env_name: str,
+	video_name: str,
+	checkpoint: str | None = None,
+	timesteps: int = 300,
+	fps: int = 30,
+	no_perturb: bool = False,
+	no_control: bool = False,
+	push_force: float | None = None,
+) -> Path:
+	if not torch.cuda.is_available():
+		raise RuntimeError("CUDA is required. CPU fallback is disabled.")
+
+	device = "cuda"
+	module = _load_single_env_module(env_name)
+	env = module.HumanoidEnv()
+	out_dir = PROJECT_ROOT / "report" / "video" / env_name
+	out_dir.mkdir(parents=True, exist_ok=True)
+	out_path = out_dir / f"{video_name}.mp4"
+
+	if no_control:
+		agent = None
+	else:
+		agent = module.PPO(env.obs_dim, env.action_dim)
+		if checkpoint is not None:
+			state_dict = torch.load(checkpoint, map_location=device)
+			agent.network.load_state_dict(state_dict)
+		agent.network.to(device)
+		agent.network.eval()
+
+	render_w, render_h = _resolve_render_size(env.model, width=1920, height=1080)
+	renderer = mujoco.Renderer(env.model, width=render_w, height=render_h)
+	frames: list[np.ndarray] = []
+
+	try:
+		obs = env.reset()
+		if no_perturb:
+			env.push_force = 0.0
+			env.push_steps_left = 0
+			if push_force is not None:
+				_tqdm_write(f"[INFO] [{env_name}] --push-force is ignored because --no-perturb is enabled.")
+		elif push_force is not None:
+			env.push_force = float(push_force)
+
+		with torch.no_grad():
+			for step_idx in _tqdm_range(max(1, timesteps), f"Rendering {env_name}"):
+				if no_control:
+					action = np.zeros((env.action_dim,), dtype=np.float32)
+				else:
+					obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
+					action_tensor, _ = agent.network.get_action(obs_tensor, deterministic=True)
+					# If the environment provides a mapping from normalized actions to actuator ctrl,
+					# use it (keeps sanity_check / goal_conditioned behavior consistent).
+					if hasattr(env, "map_action_to_ctrl"):
+						# map_action_to_ctrl expects a torch tensor with batch dim
+						try:
+							bat = action_tensor.unsqueeze(0) if action_tensor.dim() == 1 else action_tensor
+							ctrl_t = env.map_action_to_ctrl(bat)
+							action = ctrl_t.detach().cpu().numpy().squeeze(0)
+						except Exception:
+							action = action_tensor.detach().cpu().numpy()
+					else:
+						action = action_tensor.detach().cpu().numpy()
+
+				obs, reward, done, _ = env.step(action)
+
+				renderer.update_scene(env.data)
+				frames.append(renderer.render())
+
+				if step_idx % 100 == 0:
+					_tqdm_write(
+						f"[INFO] [{env_name}] step={int(step_idx)} "
+						f"reward={float(reward):.4f} "
+						f"success={bool(env.get_success())} "
+						f"done={bool(done)}"
+					)
+
+				if done:
+					obs = env.reset()
+					if no_perturb:
+						env.push_force = 0.0
+						env.push_steps_left = 0
+					elif push_force is not None:
+						env.push_force = float(push_force)
+
+		media.write_video(str(out_path), frames, fps=fps)
+	finally:
+		renderer.close()
+
+	return out_path
 
 
 def _tqdm_range(total: int, desc: str):
@@ -122,7 +227,10 @@ def _tqdm_write(message: str) -> None:
 		print(message)
 
 
-def _disable_perturbation_safely(env: GoalConditionedExecutorEnv | StrategySelectorEnv, env_name: str) -> None:
+def _disable_perturbation_safely(
+	env: GoalConditionedExecutorEnv | StrategySelectorEnv | SanityCheckEnv,
+	env_name: str,
+) -> None:
 	try:
 		env.push_force.zero_()
 		if hasattr(env, "push_steps_left"):
@@ -132,7 +240,7 @@ def _disable_perturbation_safely(env: GoalConditionedExecutorEnv | StrategySelec
 
 
 def _override_push_force_safely(
-	env: GoalConditionedExecutorEnv | StrategySelectorEnv,
+	env: GoalConditionedExecutorEnv | StrategySelectorEnv | SanityCheckEnv,
 	env_name: str,
 	push_force: float | None,
 ) -> None:
@@ -271,7 +379,7 @@ def render_episode(
 
 					if (not no_perturb) and push_steps_left > 0:
 						env.mj_data.xfrc_applied[:] = 0.0
-						env.mj_data.xfrc_applied[env._torso_body_id, 0] = push_force
+						env.mj_data.xfrc_applied[env._head_body_id, 0] = push_force
 						env.mj_data.qvel[env._rootx_qvel_idx] += push_force * env.dt * 0.02
 						push_steps_left -= 1
 					else:
@@ -322,7 +430,19 @@ def render_episode(
 		finally:
 			renderer.close()
 
-	else:
+	elif env_name in {"brace_only_single", "brace_arm_only_single"}:
+		out_path = _render_brace_single_episode(
+			env_name=env_name,
+			video_name=video_name,
+			checkpoint=checkpoint,
+			timesteps=timesteps,
+			fps=fps,
+			no_perturb=no_perturb,
+			no_control=no_control,
+			push_force=push_force,
+		)
+
+	elif env_name == "selector":
 		env = StrategySelectorEnv(num_envs=1, episode_length=max(1, timesteps), device=device)
 		resolved_ckpt = _resolve_checkpoint("selector", checkpoint)
 		if no_control:
@@ -378,6 +498,142 @@ def render_episode(
 		except Exception as exc:
 			LOGGER.exception("[%s] Video writing failed for %s: %s", env_name, out_path, exc)
 			raise
+	elif env_name == "sanity_check":
+		model_xml = PROJECT_ROOT / "assets" / "humanoid_2d" / "humanoid_2d_half.xml"
+		env = SanityCheckEnv(
+			model_xml=str(model_xml),
+			num_envs=1,
+			dt=0.02,
+			episode_length=max(1, timesteps),
+			device=device,
+		)
+		resolved_ckpt = _resolve_checkpoint("sanity_check", checkpoint)
+		random_control = (resolved_ckpt is None) and (not no_control)
+		if no_control:
+			agent = None
+		else:
+			agent = _build_agent(
+				"sanity_check",
+				obs_dim=env.obs_torch.shape[1],
+				action_dim=env.action_dim,
+				device=device,
+				checkpoint=resolved_ckpt,
+			)
+			if random_control:
+				_tqdm_write("[INFO] [sanity_check] No checkpoint provided. Using exploratory random control.")
+
+		render_w, render_h = _resolve_render_size(env.mj_model, width=1920, height=1080)
+		renderer = mujoco.Renderer(env.mj_model, width=render_w, height=render_h)
+		frames: list[np.ndarray] = []
+
+		try:
+			obs = env.reset()
+			if no_perturb:
+				_tqdm_write("[INFO] [sanity_check] --no-perturb has no effect for sanity_check env.")
+			if push_force is not None:
+				_tqdm_write("[INFO] [sanity_check] --push-force has no effect for sanity_check env.")
+
+			with torch.no_grad():
+				for step_idx in _tqdm_range(max(1, timesteps), "Rendering sanity_check"):
+					if random_control:
+						action = torch.empty((1, env.action_dim), device=device, dtype=torch.float32).uniform_(-1.0, 1.0)
+					else:
+						action = _policy_action_or_zero(
+							agent=agent,
+							obs=obs,
+							no_control=no_control,
+							action_shape=(1, env.action_dim),
+							dtype=torch.float32,
+							device=device,
+							env_name=env_name,
+						)
+
+					out = env.step(action)
+					obs = out["obs"]
+
+					mjw.get_data_into(env.mj_data, env.mj_model, env.data)
+					renderer.update_scene(env.mj_data)
+					frames.append(renderer.render())
+
+					if step_idx % 100 == 0:
+						_tqdm_write(
+							f"[INFO] [{env_name}] step={int(step_idx)} "
+							f"reward={float(out['reward'][0].item()):.4f} "
+							f"err={float(out['info']['err'][0].item()):.4f} "
+							f"jit={float(out['info']['jit'][0].item()):.4f}"
+						)
+
+					if bool(out["done"][0].item()):
+						obs = env.reset(out["done"])
+
+			media.write_video(str(out_path), frames, fps=fps)
+		finally:
+			renderer.close()
+	elif env_name == "sanity_check_single":
+		# Import the exact environment from sanity_check.py
+		import importlib.util
+		spec = importlib.util.spec_from_file_location(
+			"sanity_check", 
+			PROJECT_ROOT / "scripts" / "singleenvs" / "sanity_check.py"
+		)
+		sanity_check_module = importlib.util.module_from_spec(spec)
+		spec.loader.exec_module(sanity_check_module)
+		
+		# Use the exact HumanoidEnv class
+		model_xml = PROJECT_ROOT / "assets" / "humanoid_2d" / "humanoid_2d_half.xml"
+		env = sanity_check_module.HumanoidEnv(xml_path=str(model_xml))
+		
+		# Use the original PPONetwork class directly
+		agent = None
+		if checkpoint and not no_control:
+			agent = sanity_check_module.PPONetwork(env.obs_dim, env.action_dim)
+			agent.load_state_dict(torch.load(checkpoint, map_location=device))
+			agent.to(device)
+			agent.eval()
+			_tqdm_write(f"[INFO] [sanity_check_single] Loaded checkpoint: {checkpoint}")
+		elif not no_control:
+			_tqdm_write("[INFO] [sanity_check_single] No checkpoint provided. Using zero control.")
+		
+		render_w, render_h = _resolve_render_size(env.model, width=1920, height=1080)
+		renderer = mujoco.Renderer(env.model, width=render_w, height=render_h)
+		frames: list[np.ndarray] = []
+		
+		try:
+			obs = env.reset()
+			
+			with torch.no_grad():
+				for step_idx in _tqdm_range(max(1, timesteps), "Rendering sanity_check_single"):
+					if agent is not None:
+						action, _ = agent.get_action(torch.FloatTensor(obs).to(device), deterministic=True)
+						action = action.cpu().numpy()
+					else:
+						action = np.zeros(env.action_dim)
+					
+					next_obs, reward, done, _ = env.step(action)
+					obs = next_obs
+					
+					renderer.update_scene(env.data)
+					frames.append(renderer.render())
+					
+					if step_idx % 100 == 0:
+						success = env.get_success()
+						current_pos = np.array([env.data.qpos[env.model.jnt_qposadr[jid]] 
+											for jid in env.joint_ids])
+						distance = np.linalg.norm(current_pos - sanity_check_module.TARGET_POS)
+						_tqdm_write(
+							f"[INFO] [sanity_check_single] step={int(step_idx)} "
+							f"reward={reward:.4f} "
+							f"distance={distance:.4f} "
+							f"success={success}"
+						)
+					
+					if done:
+						obs = env.reset()
+			
+			media.write_video(str(out_path), frames, fps=fps)
+			_tqdm_write(f"[INFO] [sanity_check_single] Video saved: {out_path}")
+		finally:
+			renderer.close()
 
 	return out_path
 
@@ -385,7 +641,7 @@ def render_episode(
 def main() -> None:
 	logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 	parser = argparse.ArgumentParser()
-	parser.add_argument("--env", choices=["selector", "executor"], required=True)
+	parser.add_argument("--env", choices=["selector", "executor", "sanity_check", "sanity_check_single", "brace_only_single", "brace_arm_only_single"], required=True)
 	parser.add_argument("--video-name", type=str, default="episode")
 	parser.add_argument("--checkpoint", type=str, default=None)
 	parser.add_argument("--timesteps", type=int, default=300)

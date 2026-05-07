@@ -5,7 +5,7 @@ import math
 import xml.etree.ElementTree as ET
 from enum import IntEnum
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Sequence, Tuple
 
 import mujoco
 import mujoco_warp as mjw
@@ -29,6 +29,7 @@ class GoalConditionedExecutorEnv:
         enable_step_timing: bool = False,
         nconmax: int = 512,
         njmax: int = 1024,
+        push_force_choices: Sequence[float] | None = None,
     ):
         wp.init()
         self.num_envs = num_envs
@@ -122,10 +123,11 @@ class GoalConditionedExecutorEnv:
         self._leg_qpos_idx = self._joint_qpos_idx_any("leg_joint", "shin_joint")
         self._leg_left_qpos_idx = self._joint_qpos_idx_any("leg_left_joint", "shin_left_joint")
         self._torso_body_id = self._body_id("torso")
+        self._head_body_id = self._body_id("upper_torso")
         self._head_geom_id = self._geom_id("head")
 
         # Training-time push profile (forward x-direction).
-        self.push_force_choices = torch.tensor([20.0, 35.0, 70.0], device=self.device)
+        self.push_force_choices = self._build_push_force_choices(push_force_choices)
         self.push_steps = 5
         self.push_kick_scale = 0.02
 
@@ -150,6 +152,23 @@ class GoalConditionedExecutorEnv:
             mins.append(lo)
             maxs.append(hi)
         return torch.tensor(mins, dtype=torch.float32), torch.tensor(maxs, dtype=torch.float32)
+
+    def _build_push_force_choices(self, push_force_choices: Sequence[float] | None) -> torch.Tensor:
+        if push_force_choices is None:
+            push_force_choices = [20.0, 35.0, 70.0]
+
+        if len(push_force_choices) == 0:
+            raise ValueError("push_force_choices must contain at least one value")
+
+        try:
+            values = [float(v) for v in push_force_choices]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("push_force_choices must contain numeric values") from exc
+
+        if any(v < 0.0 for v in values):
+            raise ValueError("push_force_choices values must be non-negative")
+
+        return torch.tensor(values, device=self.device, dtype=torch.float32)
 
     def _joint_qpos_idx(self, name: str) -> int:
         j_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
@@ -387,7 +406,7 @@ class GoalConditionedExecutorEnv:
             push_active = alive & (self.push_steps_left > 0)
             if self.xfrc_torch is not None:
                 self.xfrc_torch[:] = 0.0
-                self.xfrc_torch[push_active, self._torso_body_id, 0] = self.push_force[push_active]
+                self.xfrc_torch[push_active, self._head_body_id, 0] = self.push_force[push_active]
 
             # Always apply a small velocity kick while push is active to guarantee visible perturbation.
             self.qvel_torch[push_active, self._rootx_qvel_idx] = (
