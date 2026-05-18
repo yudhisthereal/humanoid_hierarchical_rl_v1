@@ -119,8 +119,8 @@ class HumanoidEnv:
 		# BRACE-specific observation with joint velocities for jitter-awareness
 		# [com_z, knees_angle, arm_angle, forearm_angle,
 		#  arms_contact, head_contact, torso_contact,
-		#  leg_vel, leg_left_vel, arm_vel, forearm_vel]
-		self.obs_dim = 11
+		#  leg_vel, arm_vel, forearm_vel]
+		self.obs_dim = 10
 
 		self.dt = float(self.model.opt.timestep) * 5.0
 		self.obs_clip = 50.0
@@ -159,7 +159,6 @@ class HumanoidEnv:
 		self.arm_angle = 0.0
 		self.forearm_angle = 0.0
 		self.leg_vel = 0.0
-		self.leg_left_vel = 0.0
 		self.arm_vel = 0.0
 		self.forearm_vel = 0.0
 
@@ -208,7 +207,6 @@ class HumanoidEnv:
 		self.arm_angle = self._get_joint_pos(self.arm_qpos_idx)
 		self.forearm_angle = self._get_joint_pos(self.forearm_qpos_idx)
 		self.leg_vel = self._get_joint_vel(self.leg_qvel_idx)
-		self.leg_left_vel = self._get_joint_vel(self.leg_left_qvel_idx)
 		self.arm_vel = self._get_joint_vel(self.arm_qvel_idx)
 		self.forearm_vel = self._get_joint_vel(self.forearm_qvel_idx)
 
@@ -238,7 +236,6 @@ class HumanoidEnv:
 				head_contact,
 				torso_contact,
 				self.leg_vel,
-				self.leg_left_vel,
 				self.arm_vel,
 				self.forearm_vel,
 			],

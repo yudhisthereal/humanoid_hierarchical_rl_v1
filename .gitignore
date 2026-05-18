@@ -2,3 +2,5 @@ plan/
 __pycache__/
 report/
 *.pth
+*.png
+scripts/brace_only_single/checkpoints/2026-05-07-orig/training_progress.png

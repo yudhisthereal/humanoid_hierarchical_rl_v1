@@ -119,6 +119,36 @@ def _load_single_env_module(env_name: str):
 	return module
 
 
+def _zero_ctrl_action_from_env(env) -> np.ndarray:
+	"""Return a normalized action that maps to zero actuator ctrl if possible."""
+	if hasattr(env, "ctrl_min") and hasattr(env, "ctrl_max"):
+		ctrl_min = np.asarray(env.ctrl_min, dtype=np.float32)
+		ctrl_max = np.asarray(env.ctrl_max, dtype=np.float32)
+		denom = ctrl_max - ctrl_min
+		with np.errstate(divide="ignore", invalid="ignore"):
+			action = np.where(
+				denom != 0.0,
+				2.0 * (0.0 - ctrl_min) / denom - 1.0,
+				0.0,
+			)
+		return np.clip(action.astype(np.float32), -1.0, 1.0)
+	return np.zeros((int(getattr(env, "action_dim", 0)),), dtype=np.float32)
+
+
+def _make_brace_env_limp(env) -> None:
+	"""Reduce actuator stiffness so the robot goes limp after success."""
+	factor = 0.01
+	try:
+		if hasattr(env, "model") and hasattr(env.model, "actuator_gainprm"):
+			env.model.actuator_gainprm[:] *= factor
+		if hasattr(env, "model") and hasattr(env.model, "actuator_biasprm"):
+			env.model.actuator_biasprm[:] *= factor
+		if hasattr(env, "data") and hasattr(env.data, "ctrl"):
+			env.data.ctrl[:] = 0.0
+	except Exception as exc:
+		LOGGER.exception("[%s] Failed to apply limp mode: %s", getattr(env, "__class__", type(env)).__name__, exc)
+
+
 def _render_brace_single_episode(
 	env_name: str,
 	video_name: str,
@@ -155,6 +185,8 @@ def _render_brace_single_episode(
 
 	try:
 		obs = env.reset()
+		success_limp = False
+		limp_action = _zero_ctrl_action_from_env(env)
 		if no_perturb:
 			env.push_force = 0.0
 			env.push_steps_left = 0
@@ -165,25 +197,21 @@ def _render_brace_single_episode(
 
 		with torch.no_grad():
 			for step_idx in _tqdm_range(max(1, timesteps), f"Rendering {env_name}"):
-				if no_control:
+				if success_limp:
+					action = limp_action
+				elif no_control:
 					action = np.zeros((env.action_dim,), dtype=np.float32)
 				else:
 					obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
 					action_tensor, _ = agent.network.get_action(obs_tensor, deterministic=True)
-					# If the environment provides a mapping from normalized actions to actuator ctrl,
-					# use it (keeps sanity_check / goal_conditioned behavior consistent).
-					if hasattr(env, "map_action_to_ctrl"):
-						# map_action_to_ctrl expects a torch tensor with batch dim
-						try:
-							bat = action_tensor.unsqueeze(0) if action_tensor.dim() == 1 else action_tensor
-							ctrl_t = env.map_action_to_ctrl(bat)
-							action = ctrl_t.detach().cpu().numpy().squeeze(0)
-						except Exception:
-							action = action_tensor.detach().cpu().numpy()
-					else:
-						action = action_tensor.detach().cpu().numpy()
+					action = action_tensor.detach().cpu().numpy()
 
 				obs, reward, done, _ = env.step(action)
+				success = bool(env.get_success())
+				if success and not success_limp:
+					_make_brace_env_limp(env)
+					success_limp = True
+					action = limp_action
 
 				renderer.update_scene(env.data)
 				frames.append(renderer.render())
@@ -192,12 +220,14 @@ def _render_brace_single_episode(
 					_tqdm_write(
 						f"[INFO] [{env_name}] step={int(step_idx)} "
 						f"reward={float(reward):.4f} "
-						f"success={bool(env.get_success())} "
+						f"success={success} "
 						f"done={bool(done)}"
 					)
 
-				if done:
+				if done and not success:
 					obs = env.reset()
+					success_limp = False
+					limp_action = _zero_ctrl_action_from_env(env)
 					if no_perturb:
 						env.push_force = 0.0
 						env.push_steps_left = 0
