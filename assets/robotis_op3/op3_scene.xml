@@ -92,12 +92,15 @@
   <worldbody>
     <!-- scene floor and camera -->
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
-    <camera name="scene_cam" mode="trackcom" pos="0 -2.5 1.0" xyaxes="1 0 0 0 0 1"/>
+    <camera name="pov_left" mode="targetbodycom" target="body_link" pos="0 1.55 0.72"/>
+    <camera name="pov_front" mode="targetbodycom" target="body_link" pos="1.55 0.0 0.72"/>
+    <camera name="pov_right" mode="targetbodycom" target="body_link" pos="0 -1.55 0.72"/>
+    <camera name="pov_fl" mode="targetbodycom" target="body_link" pos="1.15 1.35 0.78"/>
+    <camera name="pov_top" mode="targetbodycom" target="body_link" pos="0.00 0.00 1.55"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
     <!-- inlined op3 worldbody (robot body and sub-bodies) -->
     <light mode="targetbodycom" target="body_link" pos="4 0 1"/>
-    <camera name="track_com" mode="trackcom" pos="0 -2.5 1.0" xyaxes="1 0 0 0 0 1"/>
     <body name="body_link" pos="0 0 0.3">
       <inertial pos="-0.01501 0.00013 0.06582" quat="0.704708 0.704003 0.0667707 -0.0575246" mass="1.34928" diaginertia="0.00341264 0.00316574 0.00296931"/>
       <freejoint/>

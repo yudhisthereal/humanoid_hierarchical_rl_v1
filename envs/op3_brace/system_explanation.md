@@ -1,5 +1,11 @@
 # OP3 Brace Environment System Design
 
+## Recent Changes
+- 2026-05-19: Default `head_tilt` changed from -1.0 to 0.0 (level).
+- 2026-05-19: Note: `op3_arm_brace` received reward-shaping updates (immediate arm-contact reward, survival bonus for avoiding head contact, stricter arm-sync tolerance, and tuned torque/jitter penalties).
+- 2026-05-19: Training fixes applied in `op3_arm_brace` (policy outputs now tanh-squashed; sampling/log-prob corrected; PPO old_log_probs bug fixed).
+
+
 ## Overview
 
 The OP3 Brace environment is a single-env, MuJoCo-based RL task where the OP3 humanoid robot learns to brace itself when pushed, by controlling arm extension to absorb impact while preventing the head from touching the ground. This environment mirrors the architecture of `scripts/brace_only_single/brace_only_single.py` but replaces the 2D humanoid with the full OP3 kinematics and introduces joint control constraints, IMU-based observations, and a torque-aware reward function.
@@ -60,7 +66,7 @@ $$\text{target}_j = \text{ctrl\_min}_j + 0.5 \cdot (\text{action}_j + 1.0) \cdot
 | Joint | Value [rad] | Notes |
 |-------|---|---|
 | `head_pan` | 0.0 | Always straight ahead |
-| `head_tilt` | −1.0 | Always fixed down |
+| `head_tilt` | 0.0 | Always fixed level |
 | `l_hip_yaw` | 0.0 | No yaw control for stability |
 | `r_hip_yaw` | 0.0 | No yaw control for stability |
 | `l_ank_pitch` | 0.0 | Ankles locked |
@@ -269,7 +275,7 @@ This is stricter than achieving 100% success once; it requires sustained high pe
    - Applied for 5 steps (~0.025 s) at episode start.
 4. Set fixed joints explicitly:
    - `head_pan` → 0.0
-   - `head_tilt` → −1.0
+  - `head_tilt` → 0.0
    - All hip yaw, ankle joints → 0.0
 5. Set initial arm target poses for position control (optional, for smooth initial phase).
 6. Clear contact timers: $t_A^L, t_A^R, t_H, t_K, t_{torso} \leftarrow \infty$.

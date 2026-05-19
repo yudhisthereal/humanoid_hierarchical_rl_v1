@@ -43,7 +43,10 @@ class PPONetwork(nn.Module):
 			nn.Linear(hidden_dim, hidden_dim),
 			nn.Tanh(),
 		)
-		self.policy_mean = nn.Linear(hidden_dim, action_dim)
+		self.policy_mean = nn.Sequential(
+			nn.Linear(hidden_dim, action_dim),
+			nn.Tanh()  # Constrain to [-1, 1]
+		)
 		self.policy_logstd = nn.Parameter(torch.zeros(action_dim))
 		self.value = nn.Linear(hidden_dim, 1)
 
@@ -57,12 +60,17 @@ class PPONetwork(nn.Module):
 		if obs.dim() == 1:
 			obs = obs.unsqueeze(0)
 
-		mean, value = self.forward(obs)
+		shared_out = self.shared(obs)
+		mean = self.policy_mean(shared_out)  # Already in [-1, 1] from tanh
+		value = self.value(shared_out)
+		
 		if deterministic:
 			action = mean
 		else:
 			std = self.policy_logstd.exp()
-			action = mean + std * torch.randn_like(mean)
+			# Sample in Gaussian space and apply tanh
+			raw_action = mean + std * torch.randn_like(mean)
+			action = torch.tanh(raw_action)
 		return action.squeeze(0), value.squeeze(0)
 
 
@@ -105,13 +113,15 @@ class PPO:
 		advantages = torch.FloatTensor(advantages)
 		advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-		mean, _ = self.network(obs)
-		old_log_probs = self._log_prob(mean, self.network.policy_logstd, actions).sum(dim=-1).detach()
+		# Use detached forward pass to compute old_log_probs
+		with torch.no_grad():
+			mean, _ = self.network(obs)
+			old_log_probs = self._log_prob(mean, self.network.policy_logstd, actions).detach()
 
 		for _ in range(4):
 			mean, values = self.network(obs)
 			values = values.squeeze()
-			new_log_probs = self._log_prob(mean, self.network.policy_logstd, actions).sum(dim=-1)
+			new_log_probs = self._log_prob(mean, self.network.policy_logstd, actions)
 
 			ratio = (new_log_probs - old_log_probs).exp()
 			surr1 = ratio * advantages
@@ -130,9 +140,43 @@ class PPO:
 			self.optimizer.step()
 
 	def _log_prob(self, mean, logstd, action):
-		std = logstd.exp()
-		var = std**2
-		return -((action - mean) ** 2) / (2 * var) - logstd - 0.5 * np.log(2 * np.pi)
+		"""Compute log probability with tanh squashing correction.
+		
+		Note: mean is already tanh-squashed to [-1, 1].
+		We need to account for the change of variables from the 
+		unsquashed Gaussian space to the tanh-squashed action space.
+		"""
+		# Ensure tensors have compatible shapes for batch computations
+		# action: [B, A] or [A]
+		action_clamped = torch.clamp(action, -0.999999, 0.999999)
+		# Expand mean/logstd to match action batch if necessary
+		if mean.dim() == 1:
+			# mean: [A] -> [1, A]
+			mean_exp = mean.unsqueeze(0).expand(action_clamped.size(0), -1)
+		else:
+			mean_exp = mean
+
+		if logstd.dim() == 1:
+			logstd_exp = logstd.unsqueeze(0).expand(action_clamped.size(0), -1)
+		else:
+			logstd_exp = logstd
+
+		std_exp = logstd_exp.exp()
+
+		# Inverse tanh: arctanh(a) = 0.5 * ln((1 + a) / (1 - a))
+		raw_action = 0.5 * torch.log((1.0 + action_clamped) / (1.0 - action_clamped))
+
+		# Elementwise Gaussian log-prob in raw space
+		var = std_exp ** 2
+		log_prob_element = -((raw_action - mean_exp) ** 2) / (2 * var) - logstd_exp - 0.5 * np.log(2 * np.pi)
+
+		# Sum over action dims to get per-sample log-prob
+		log_prob = log_prob_element.sum(dim=-1)
+
+		# Correction for tanh transformation: subtract sum(log(1 - a^2)) per sample
+		correction = torch.sum(torch.log(1.0 - action_clamped ** 2 + 1e-8), dim=-1)
+		log_prob = log_prob - correction
+		return log_prob
 
 
 class LivePlot:
@@ -195,6 +239,7 @@ class LivePlot:
 
 def main():
 	parser = argparse.ArgumentParser(description="Train OP3 Arm-Only Brace PPO (single env).")
+	parser.add_argument("--checkpoint", type=str, help="Path to the checkpoint file to continue training from")
 	parser.add_argument("--run_label", required=True, help="Label for this training run; used to name checkpoint folder")
 	args = parser.parse_args()
 
@@ -203,6 +248,9 @@ def main():
 
 	env = Op3ArmBraceEnv()
 	agent = PPO(env.obs_dim, env.action_dim, entropy_coef=0.01)
+
+	if args.checkpoint:
+		agent.network.load_state_dict(torch.load(args.checkpoint))
 	plot = LivePlot("OP3 Arm-Only Brace PPO Training Progress")
 
 	max_iters = 1000

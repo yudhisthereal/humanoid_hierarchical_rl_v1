@@ -51,7 +51,7 @@ class Op3ArmBraceEnv:
     # Fixed controls (not actuated by policy)
     FIXED_ACTUATORS = {
         "head_pan_act": 0.0,
-        "head_tilt_act": -1.0,
+        "head_tilt_act": 0.0,
         "l_hip_yaw_act": 0.0,
         "l_hip_roll_act": 0.0,
         "l_hip_pitch_act": 0.0,
@@ -277,45 +277,51 @@ class Op3ArmBraceEnv:
         self.data.ctrl[:] = ctrl
 
     def _compute_reward(self, action: np.ndarray, success: bool, done: bool) -> tuple[float, dict[str, float]]:
+        # Reward for arms making contact (immediate signal)
+        arms_contacted = not np.isinf(self.t_arms_l) and not np.isinf(self.t_arms_r)
+        r_arms_contact = 5.0 if arms_contacted else 0.0
+        
+        # Bonus for synchronized arm contact
         t_arms_min = min(self.t_arms_l, self.t_arms_r)
-
-        if np.isinf(t_arms_min):
-            r_arm_first = 0.0
+        if arms_contacted:
+            r_arm_sync = 1.0 - float(np.tanh(abs(self.t_arms_l - self.t_arms_r) / 0.2))  # Stricter sync
         else:
-            r_arm_first = float(np.tanh(max(self.t_head - t_arms_min, 0.0) / 1.0))
-
-        if np.isinf(self.t_arms_l) or np.isinf(self.t_arms_r):
             r_arm_sync = 0.0
-        else:
-            r_arm_sync = 1.0 - float(np.tanh(abs(self.t_arms_l - self.t_arms_r)))
-
+        
+        # Penalty for head contact (should never touch)
         head_z = self._head_min_z()
-        c_head_impact = max(0.0, 0.15 - head_z) * 5.0
-        r_contact = r_arm_first + 0.8 * r_arm_sync - c_head_impact
-
+        c_head_impact = max(0.0, 0.15 - head_z) * 10.0  # Stronger penalty
+        
+        # Survival bonus for each step without head contact
+        r_survival = 0.01 if not self._has_floor_contact(self.head_geom_ids) else 0.0
+        
+        # Penalize extreme torques (encourage energy efficiency)
         torque_sum = float(np.sum(np.abs(np.asarray(self.data.actuator_force[self.arm_actuator_ids], dtype=np.float32))))
-        r_torque = -torque_sum
-
+        r_torque = -0.01 * torque_sum
+        
+        # Penalize action jitter (encourage smooth motion)
         prev = np.asarray(self.prev_action, dtype=np.float32)
         curr = np.asarray(action, dtype=np.float32)
         mask = (np.abs(prev) >= 0.5) & (np.abs(curr) >= 0.5) & (np.sign(prev) != np.sign(curr))
         n_jitter = int(np.sum(mask))
-        r_jitter = -float(n_jitter)
-
-        reward = 10.0 * r_contact + 0.5 * r_torque + 0.5 * r_jitter
+        r_jitter = -0.1 * float(n_jitter)
+        
+        # Compose reward
+        reward = r_arms_contact + 0.8 * r_arm_sync - c_head_impact + r_survival + r_torque + r_jitter
+        
+        # Success bonus
         if done and success:
             reward += 100.0
 
         reward = float(np.clip(np.nan_to_num(reward, nan=0.0), -self.reward_clip, self.reward_clip))
 
         return reward, {
-            "r_contact": float(r_contact),
+            "r_arms_contact": float(r_arms_contact),
+            "r_arm_sync": float(r_arm_sync),
+            "r_survival": float(r_survival),
             "r_torque": float(r_torque),
             "r_jitter": float(r_jitter),
-            "r_arm_first": float(r_arm_first),
-            "r_arm_sync": float(r_arm_sync),
             "c_head_impact": float(c_head_impact),
-            "n_jitter": float(n_jitter),
             "success_bonus": 100.0 if (done and success) else 0.0,
         }
 

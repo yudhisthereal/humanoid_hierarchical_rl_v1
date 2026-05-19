@@ -1,5 +1,11 @@
 # OP3 Arm-Only Brace Environment System Design
 
+## Recent Changes
+- 2026-05-19: Default `head_tilt` changed from -1.0 to 0.0 (level).
+- 2026-05-19: Reward shaping updated: immediate arm-contact reward, survival bonus for avoiding head contact, stricter arm-sync tolerance, and tuned torque/jitter penalties.
+- 2026-05-19: Training fixes applied (PPONetwork outputs now tanh-squashed; sampling/log-prob corrected; PPO old_log_probs bug fixed).
+
+
 ## Overview
 
 The OP3 Arm-Only Brace environment is a simplified variant of the full OP3 Brace task. The robot learns to control **only its arms** to brace itself when pushed, without any hip or knee actuation. The legs remain rigid (fixed in place), and all bracing effort must come from arm extension. This is a more constrained, arm-focused variant useful for studying upper-body impact absorption.
@@ -54,7 +60,7 @@ $$\text{target}_j = \text{ctrl\_min}_j + 0.5 \cdot (\text{action}_j + 1.0) \cdot
 | Joint | Value [rad] | Notes |
 |-------|---|---|
 | `head_pan` | 0.0 | Always straight ahead |
-| `head_tilt` | −1.0 | Always fixed down |
+| `head_tilt` | 0.0 | Always fixed level |
 | `l_hip_yaw` | 0.0 | Locked |
 | `r_hip_yaw` | 0.0 | Locked |
 | `l_hip_roll` | 0.0 | Locked |
