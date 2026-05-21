@@ -1,16 +1,16 @@
 # OP3 Brace Environment System Design
 
 ## Recent Changes
-- 2026-05-19: Default `head_tilt` changed from -1.0 to 0.0 (level).
-- 2026-05-19: Note: `op3_arm_brace` received reward-shaping updates (immediate arm-contact reward, survival bonus for avoiding head contact, stricter arm-sync tolerance, and tuned torque/jitter penalties).
-- 2026-05-19: Training fixes applied in `op3_arm_brace` (policy outputs now tanh-squashed; sampling/log-prob corrected; PPO old_log_probs bug fixed).
+- 2026-05-21: `op3_brace` fully implemented with full-body control (12 DOF: 6 arms + 6 legs), 31-dim observation space.
+- 2026-05-21: Leg joint control ranges finalized: hip roll/pitch, knee joints with specified bounds.
+- 2026-05-21: Reward structure: arm-first contact (primary), arm synchronization, head-impact penalty, torque efficiency, jitter smoothness.
 
 
 ## Overview
 
-The OP3 Brace environment is a single-env, MuJoCo-based RL task where the OP3 humanoid robot learns to brace itself when pushed, by controlling arm extension to absorb impact while preventing the head from touching the ground. This environment mirrors the architecture of `scripts/brace_only_single/brace_only_single.py` but replaces the 2D humanoid with the full OP3 kinematics and introduces joint control constraints, IMU-based observations, and a torque-aware reward function.
+The OP3 Brace environment (`Op3BraceEnv`) is a single-env, MuJoCo-based RL task where the OP3 humanoid robot learns to brace itself when pushed, by controlling both **arms and legs** to absorb impact while preventing the head from touching the ground. This full-body variant enables more sophisticated bracing strategies involving coordinated leg stabilization and arm extension.
 
-**Key Design Principle:** No Warp GPU parallelization; single-env, pure MuJoCo CPU simulation with PyTorch for learning.
+**Key Design Principle:** No Warp GPU parallelization; single-env, pure MuJoCo CPU simulation with PyTorch for RL training. Full-body control enables complex bracing dynamics.
 
 ---
 
@@ -23,16 +23,18 @@ The OP3 Brace environment is a single-env, MuJoCo-based RL task where the OP3 hu
 | 0 | `body_roll` | rad | Body roll angle (rotation around X) |
 | 1 | `body_pitch` | rad | Body pitch angle (rotation around Y) |
 | 2–3 | `body_angvel_rp` | rad/s | Angular velocity (roll rate, pitch rate) |
-| 4–15 | `joint_angles` | rad | 12 actuated joint positions: `[l_sho_pitch, l_sho_roll, l_el, r_sho_pitch, r_sho_roll, r_el, l_hip_pitch, l_hip_roll, l_knee, r_hip_pitch, r_hip_roll, r_knee]` |
-| 16–27 | `joint_velocities` | rad/s | 12 actuated joint velocities: `[l_sho_pitch_vel, l_sho_roll_vel, l_el_vel, r_sho_pitch_vel, r_sho_roll_vel, r_el_vel, l_hip_pitch_vel, l_hip_roll_vel, l_knee_vel, r_hip_pitch_vel, r_hip_roll_vel, r_knee_vel]` |
-| 28–30 | `contact_flags` | {0,1} | 3 binary contact indicators: `[arms_contact, head_contact, knees_contact]` (1 = actual MuJoCo contact with floor, 0 = no contact) |
+| 4–15 | `joint_angles` | rad | 12 actuated joint positions: `[l_sho_pitch, l_sho_roll, l_el, r_sho_pitch, r_sho_roll, r_el, l_hip_roll, l_hip_pitch, l_knee, r_hip_roll, r_hip_pitch, r_knee]` |
+| 16–27 | `joint_velocities` | rad/s | 12 actuated joint velocities (corresponding to joint angles above) |
+| 28–30 | `contact_flags` | {0,1} | 3 binary contact indicators: `[arms_contact, head_contact, feet_contact]` (1 = actual MuJoCo contact with floor, 0 = no contact) |
 
 ### Notes
-- **Body orientation** extracted from the root (free) joint quaternion via Euler angle conversion.
-- **Body angular velocity** (roll, pitch rates) extracted from body frame angular velocity.
-- **Joint angles and velocities** are absolute positions and velocities in radians/rad-per-second from the OP3 model's joint structure.
-- **Contact flags** determined by iterating MuJoCo contact array (`data.ncon`, `data.contact[i]`) and checking for collision pairs where one geom is in the limb group (arms/head/knees) and the other is the floor.
-- **Jitter detection:** Joint velocities enable rapid detection of sign-flip reversals; critical for smooth-movement penalty in reward.
+- **Body orientation** extracted from the root (free) joint quaternion via Euler angle conversion (roll-pitch-yaw).
+- **Body angular velocity** (roll, pitch rates) extracted from body frame angular velocity vector.
+- **Joint angles and velocities** are absolute positions and velocities in radians/rad-per-second from the OP3 model's joint structure (6 arm + 6 leg joints).
+- **Contact flags** determined by iterating MuJoCo contact array (`data.ncon`, `data.contact[i]`) and checking for collision pairs where one geom is in the limb group (arms/head/feet) and the other is the floor.
+- **Arm contact:** True if **either** left or right arm geoms contact the floor.
+- **Head contact:** True if any head geoms contact the floor.
+- **Feet contact:** True if any leg geoms contact the floor.
 
 ---
 
@@ -44,22 +46,22 @@ Normalized actions are mapped to absolute joint position targets via affine scal
 
 $$\text{target}_j = \text{ctrl\_min}_j + 0.5 \cdot (\text{action}_j + 1.0) \cdot (\text{ctrl\_max}_j - \text{ctrl\_min}_j)$$
 
-### Actuated Joints
+### Actuated Joints (Arms + Legs)
 
 | Index | Joint Name | Control Range [rad] | Notes |
 |-------|-----------|---|---|
 | 0 | `l_sho_pitch` | [−1.7, 1.7] | Left shoulder pitch |
-| 1 | `l_sho_roll` | [−1, 1] | Left shoulder roll |
-| 2 | `l_el` | [−1, 1] | Left elbow |
+| 1 | `l_sho_roll` | [−1.0, 1.0] | Left shoulder roll |
+| 2 | `l_el` | [−1.0, 1.0] | Left elbow |
 | 3 | `r_sho_pitch` | [−1.7, 1.7] | Right shoulder pitch |
-| 4 | `r_sho_roll` | [−1, 1] | Right shoulder roll |
-| 5 | `r_el` | [−1, 1] | Right elbow |
-| 6 | `l_hip_pitch` | [−0.57, −0.07] | Left hip pitch |
-| 7 | `l_hip_roll` | [−0.45, 0] | Left hip roll |
-| 8 | `l_knee` | [0.57, 1.57] | Left knee |
-| 9 | `r_hip_pitch` | [0.07, 0.57] | Right hip pitch |
-| 10 | `r_hip_roll` | [0, 0.45] | Right hip roll |
-| 11 | `r_knee` | [−1.57, −0.57] | Right knee |
+| 4 | `r_sho_roll` | [−1.0, 1.0] | Right shoulder roll |
+| 5 | `r_el` | [−1.0, 1.0] | Right elbow |
+| 6 | `l_hip_roll` | [−0.5, 0.0] | Left hip roll |
+| 7 | `l_hip_pitch` | [−1.0, 0.0] | Left hip pitch |
+| 8 | `l_knee` | [0.0, 1.57] | Left knee |
+| 9 | `r_hip_roll` | [0.0, 0.5] | Right hip roll |
+| 10 | `r_hip_pitch` | [0.0, 1.0] | Right hip pitch |
+| 11 | `r_knee` | [−1.57, 0.0] | Right knee |
 
 ### Fixed (Non-Actuated) Joints
 
@@ -67,30 +69,27 @@ $$\text{target}_j = \text{ctrl\_min}_j + 0.5 \cdot (\text{action}_j + 1.0) \cdot
 |-------|---|---|
 | `head_pan` | 0.0 | Always straight ahead |
 | `head_tilt` | 0.0 | Always fixed level |
-| `l_hip_yaw` | 0.0 | No yaw control for stability |
-| `r_hip_yaw` | 0.0 | No yaw control for stability |
-| `l_ank_pitch` | 0.0 | Ankles locked |
-| `l_ank_roll` | 0.0 | Ankles locked |
-| `r_ank_pitch` | 0.0 | Ankles locked |
-| `r_ank_roll` | 0.0 | Ankles locked |
+| `l_hip_yaw`, `r_hip_yaw` | 0.0 | No yaw control for stability |
+| `l_ank_pitch`, `l_ank_roll` | 0.0 | Ankles locked |
+| `r_ank_pitch`, `r_ank_roll` | 0.0 | Ankles locked |
 
-**Implementation:** During environment step, fixed joints are explicitly set to their target values in the control input before calling `mujoco.mj_step()`.
+**Implementation:** Fixed joints are explicitly set to their target values in the control input via the `FIXED_ACTUATORS` dictionary before calling `mujoco.mj_step()`.
 
 ---
 
 ## Policy Network Architecture
 
-**Class: `Op3PPONetwork(nn.Module)`**
+**Class: `Op3PPONetwork(nn.Module)` (or custom network in training script)**
 
 ```
-Input: obs (shape [batch] or [])
+Input: obs (shape [batch] or [])  # 31-dim observation
   ↓
 Shared Backbone:
   Linear(31 → 64) + Tanh
   Linear(64 → 64) + Tanh
   ↓
 Policy Head:
-  Linear(64 → 12)  →  mean (action means)
+  Linear(64 → 12)  →  mean (action means, μ)
   
 Value Head:
   Linear(64 → 1)   →  value (scalar critic estimate)
@@ -108,17 +107,21 @@ action_mean = policy_head(shared)
 value = value_head(shared)
 
 if deterministic:
-    action = action_mean
+    action = tanh(action_mean)  # Deterministic policy
 else:
-    std = exp(policy_logstd)
-    action = action_mean + std * randn_like(action_mean)
+    std = exp(clip(policy_logstd, -5, 2))  # Bounded std
+    action = tanh(action_mean + std * randn_like(action_mean))  # Tanh-squashed
 ```
+
+**Key Points:**
+- Actions are **tanh-squashed** to enforce [-1, 1] bounds.
+- Log-probability is corrected for tanh transformation: $\log \pi(a|s) = \log \mu(u|s) - \sum_i \log(1 - a_i^2)$ where $a_i = \tanh(u_i)$.
 
 ---
 
 ## Training Hyperparameters
 
-All hyperparameters are inherited from the brace_only_single baseline to ensure consistency.
+All hyperparameters are optimized for the arm-only bracing task based on `op3_arm_brace_v2` defaults.
 
 | Category | Parameter | Value |
 |----------|-----------|-------|
@@ -133,97 +136,104 @@ All hyperparameters are inherited from the brace_only_single baseline to ensure 
 | | Trajectory GAE λ | 0.95 |
 | | Discount factor (γ) | 0.99 |
 | **Episode** | Episode length (timeout) | 200 steps |
-| | MuJoCo substeps per step | 5 |
+| | MuJoCo substeps per step | 5 (frame_skip) |
 | **Stopping** | Target success rate | ≥95% (over 10-episode window) |
 | | Early stop condition | Maintain ≥95% for 100+ consecutive episodes |
 | **Checkpointing** | Save interval | Every 10 iterations |
-| | Maximum iterations | 1000 |
+| | Maximum iterations | 1000+ |
 
 ---
 
 ## Reward Function
 
-Per-step reward is computed as a combination of contact-sequence reward, torque penalty, and a success bonus applied at episode end.
+Per-step reward is composed of multiple components designed to encourage arm-first contact, synchronized bracing, and energy efficiency. All contact timing is **MuJoCo contact array-based**.
 
-### 1. Contact Sequence Reward ($R_{contact}$)
+### 1. Arm-First Contact Reward ($R_{arm\_first}$)
 
-Encourages arms to contact the floor first (before head or torso), with synchronized left/right arm impact and controlled knee timing. **All contact timing based on MuJoCo contact array detection.**
+Reward for arms contacting before head or torso:
 
-$$R_{contact} = w_1 \cdot r_{arm\_first} + w_2 \cdot r_{arm\_sync} + w_3 \cdot r_{knee\_timing} - c_{head\_impact}$$
+$$R_{arm\_first} = \tanh\left(\frac{\max(t_H - t_A^{min}, 0)}{1.0}\right)$$
 
-**Terms:**
+where $t_A^{min} = \min(t_A^L, t_A^R)$ and $t_H$ is head contact time (from MuJoCo array). If no arms contact, $R_{arm\_first} = 0$.
 
-- **$r_{arm\_first}$** (weight $w_1 = 1.0$):  
-  If at least one arm has made ground contact (detected via MuJoCo contact array):
-  $$r_{arm\_first} = \tanh\left(\frac{\max(t_H - t_{arms}^{min}, 0)}{1.0}\right)$$
-  where $t_{arms}^{min} = \min(t_A^L, t_A^R)$ (first arm contact time from MuJoCo array) and $t_H$ is head contact time (from MuJoCo array). If no arms contact, $r_{arm\_first} = 0$.
+**Weight:** $w_{arm\_first} = 1.0$ (highest priority)
 
-- **$r_{arm\_sync}$** (weight $w_2 = 0.8$):  
-  Reward for synchronized left/right arm contact (both detected via MuJoCo contact array):
-  $$r_{arm\_sync} = 1.0 - \tanh(|t_A^L - t_A^R|)$$
-  where $t_A^L$ and $t_A^R$ are first contact times for left and right arms from the MuJoCo contact array. Evaluated only if both arms contact; else $r_{arm\_sync} = 0$.
+### 2. Arm Synchronization Reward ($R_{arm\_sync}$)
 
-- **$r_{knee\_timing}$** (weight $w_3 = 1.0$):  
-  Penalty for early knee contact relative to arms (all from MuJoCo contact array):
-  $$r_{knee\_timing} = 1.0 - \tanh\left(\frac{|t_K - t_{arms}^{min}|}{0.2}\right)$$
-  where $t_K$ is first knee contact time from MuJoCo array. Evaluated if knees contact; else $r_{knee\_timing} = 0$.
+Bonus for synchronized left/right arm contact:
 
-- **$c_{head\_impact}$** (per-step penalty):  
-  $$c_{head\_impact} = \max(0, 0.15 - z_{head}) \times 5.0$$
-  Penalizes low head position to discourage head-ground proximity. (Soft penalty; hard termination occurs only if MuJoCo detects actual head-ground contact.)
+$$R_{arm\_sync} = 1.0 - \tanh(|t_A^L - t_A^R|)$$
 
-### 2. Torque Load Penalty ($R_{torque}$)
+Evaluated only if both arms have contacted; else $R_{arm\_sync} = 0$.
 
-Per-step penalty on cumulative joint actuation effort to encourage energy-efficient bracing.
+**Weight:** $w_{arm\_sync} = 0.8$
 
-$$R_{torque} = -\sum_{j=1}^{12} |\tau_j|$$
+### 3. Knee Timing Reward ($R_{knee\_timing}$)
 
-where:
-- $\tau_j$ = actuator force/effort of joint $j$, computed via `data.actuator_force[actuator_id]`
-- Summed over all 12 actuated joints per step (NOT normalized; raw effort sum)
+Penalty for early knee contact relative to arms:
 
-### 3. Jitter Penalty ($R_{jitter}$)
+$$R_{knee\_timing} = 1.0 - \tanh\left(\frac{|t_K - t_A^{min}|}{0.2}\right)$$
 
-Per-step penalty on action sign-flips to encourage smooth, coherent movement.
+where $t_K$ is first knee contact time from MuJoCo array. Evaluated if knees contact; else $R_{knee\_timing} = 0$.
+
+**Weight:** $w_{knee\_timing} = 1.0$
+
+### 4. Head Impact Penalty ($C_{head\_impact}$)
+
+Per-step penalty on head height to discourage proximity to floor:
+
+$$C_{head\_impact} = \max(0.0, 0.15 - z_{head}) \times 5.0$$
+
+where $z_{head}$ is the minimum Z-coordinate across all head geoms.
+
+**Weight:** −1.0 (penalty)
+
+### 5. Torque Load Penalty ($R_{torque}$)
+
+Per-step penalty on cumulative actuation effort to encourage energy-efficient bracing:
+
+$$R_{torque} = -\sum_{j=0}^{11} |\tau_j|$$
+
+where $\tau_j = \text{data.actuator\_force}[j]$ is the actuator force/torque of actuator $j$.
+
+**Weight:** $w_{torque} = 0.5$
+
+### 6. Jitter Penalty ($R_{jitter}$)
+
+Per-step penalty on action sign-flips to encourage smooth, coherent movement:
 
 $$R_{jitter} = -n_{jitter}$$
 
 where $n_{jitter}$ is the count of actuators experiencing sign-flip jitter:
 - For each of the 12 actuators, check if the normalized action value changed sign between consecutive steps.
 - **Condition for jitter:** $|\text{action}_{t-1}[j]| \geq 0.5$ AND $|\text{action}_{t}[j]| \geq 0.5$ AND $\text{sign}(\text{action}_{t-1}[j]) \neq \text{sign}(\text{action}_{t}[j])$
-- Count the number of actuators satisfying this condition; $n_{jitter} \in [0, 12]$.
-- **Rationale:** Encourages consistent movement direction within significant actions; rapid reversals are penalized.
+- $n_{jitter} \in [0, 12]$.
 
-### 4. Success Bonus
+**Weight:** $w_{jitter} = 0.5$
+
+### 7. Success Bonus
 
 Applied **only at episode termination** if success criteria are met:
 
-$$R_{success} = \begin{cases} +100.0 & \text{if episode succeeds} \\ 0.0 & \text{otherwise} \end{cases}$$
+$$R_{success} = 100.0 \text{ if episode succeeds, else } 0.0$$
 
-### Total Reward Function
+### Total Per-Step Reward
 
-**Per-step reward (before success bonus):**
+$$R_t = w_{arm\_first} \cdot R_{arm\_first} + w_{arm\_sync} \cdot R_{arm\_sync} + w_{knee\_timing} \cdot R_{knee\_timing} - C_{head\_impact} + w_{torque} \cdot R_{torque} + w_{jitter} \cdot R_{jitter}$$
 
-$$R_t = w_{contact} \cdot R_{contact}(t) + w_{torque} \cdot R_{torque}(t) + w_{jitter} \cdot R_{jitter}(t)$$
+**Clipping:** Final per-step reward is clipped to [−100, +100].
 
-**At episode termination:**
-
-$$R_{final} = R_{success}$$
-
-**Combined episode-step reward:**
-
-$$R_{\text{total}} = \sum_{t=1}^{T} R_t + R_{final}$$
-
-where $T$ is the episode length (≤ 200 steps) and weights are:
+**Component Priority:**
 
 | Component | Weight | Priority | Intuition |
 |-----------|--------|----------|-----------|
-| $R_{contact}$ | $w_{contact} = 10.0$ | **1st (Highest)** | Arm-first contact is the core task objective. |
-| $R_{torque}$ | $w_{torque} = 0.5$ | **2nd** | Energy efficiency is secondary; encourage controlled, low-effort bracing. |
-| $R_{jitter}$ | $w_{jitter} = 0.5$ | **2nd (Equal)** | Smooth movement prevents oscillation and jerky behavior; equal to torque. |
-| $R_{success}$ | — | **Bonus** | Episode-level success bonus applied only if all success criteria met. |
-
-**Clipping:** Final per-step reward is clipped to [−100, +100].
+| $R_{arm\_first}$ | 1.0 | **1st (Highest)** | Arm-first contact is the core defensive task. |
+| $R_{arm\_sync}$ | 0.8 | **1st+** | Synchronized arms maximize bracing effectiveness. |
+| $R_{knee\_timing}$ | 1.0 | **1st+ (Equal)** | Timely knee contact supports the bracing strategy. |
+| $R_{torque}$ | 0.5 | **2nd** | Energy efficiency is secondary; encourage controlled bracing. |
+| $R_{jitter}$ | 0.5 | **2nd (Equal)** | Smooth movement prevents oscillation and jerky behavior. |
+| $C_{head\_impact}$ | −5.0 | **Hard constraint** | Head height penalty; head should not touch floor. |
+| $R_{success}$ | 100.0 | **Episode bonus** | Final reward applies only at termination if all criteria met. |
 
 ---
 
@@ -247,12 +257,12 @@ Episode ends if **any** of the following occur:
 
 An episode is considered **successful** if **all** of the following hold at episode termination:
 
-1. **Head never touches ground** during the episode (no MuJoCo contact between head geoms and floor at any step).
-2. **Left arm contacts first:** $t_A^L < t_H$ AND $t_A^L < t_K$ AND $t_A^L < t_{torso}$, where times are determined from MuJoCo contact array.
-3. **Right arm contacts first:** $t_A^R < t_H$ AND $t_A^R < t_K$ AND $t_A^R < t_{torso}$, where times are determined from MuJoCo contact array.
-4. **Arms synchronized:** $|t_A^L - t_A^R| \leq 0.1$ seconds, where times are from actual contact detection.
+1. **Head never touches ground** during the episode (no MuJoCo contact between head geoms and floor at any step): $t_H = \infty$
+2. **Left arm contacts ground before head:** $t_A^L < t_H$
+3. **Right arm contacts ground before head:** $t_A^R < t_H$
+4. **Arms synchronized:** $|t_A^L - t_A^R| \leq 0.1$ seconds (timing from MuJoCo contact array)
 
-(All contact timing is based on MuJoCo contact array detection only; only arms, head, and knees matter.)
+All contact timing is based on MuJoCo contact array detection only.
 
 ### Training Stopping Condition
 
@@ -270,18 +280,41 @@ This is stricter than achieving 100% success once; it requires sustained high pe
 
 1. Reset all joint positions and velocities to zero (via `mujoco.mj_resetData()`).
 2. Raise COM slightly (+0.05 m in Z) to avoid initial collision.
-3. Apply an initial push impulse:
+3. **Apply initial push impulse** (V2 approach):
    - Fixed push force: **90.0 N** in +X direction (forward).
-   - Applied for 5 steps (~0.025 s) at episode start.
-4. Set fixed joints explicitly:
-   - `head_pan` → 0.0
-  - `head_tilt` → 0.0
+   - Applied for **5 steps** (~0.025 s wall-clock time) at episode start.
+   - Applied via both direct velocity impulse and external force application on the body.
+4. Set fixed controls explicitly:
+   - `head_pan`, `head_tilt` → 0.0
    - All hip yaw, ankle joints → 0.0
-5. Set initial arm target poses for position control (optional, for smooth initial phase).
-6. Clear contact timers: $t_A^L, t_A^R, t_H, t_K, t_{torso} \leftarrow \infty$.
+5. Set initial arm targets to neutral (zeros).
+6. **Clear contact timers after push phase:** $t_A^L, t_A^R, t_H \leftarrow \infty$
+   - This ensures success/reward metrics only evaluate the **recovery phase**, not the push itself.
+7. Call `mujoco.mj_forward()` to finalize state.
 
 ### Reset Returns
-- Initial observation (31-dim).
+- Initial observation (19-dim) from post-push state.
+
+### Push Mechanism Details
+
+The push is applied **during** reset before the policy gains control:
+
+```python
+push_impulse = float(push_force) * (dt * push_kick_scale)  # Scale factor ~0.02
+data.qvel[root_dof_adr + 0] += push_impulse  # Direct velocity boost
+
+for _ in range(push_steps):  # 5 steps
+    data.xfrc_applied[body_id, 0] = push_force  # 90 N forward
+    for _ in range(frame_skip):  # 5 substeps per step
+        mujoco.mj_step(model, data)
+
+data.xfrc_applied[:] = 0.0  # Clear applied forces
+
+# Reset contact timers so recovery phase is tracked separately
+t_arms_l, t_arms_r, t_head = inf, inf, inf
+```
+
+**Design rationale:** The push simulates a disturbance or collision that the policy must respond to. By applying it during reset and then clearing contact timers, the policy learns to react to the perturbation within the 200-step episode window.
 
 ---
 
@@ -345,26 +378,33 @@ OP3 uses position-servo actuators. Each actuator is a proportional controller ta
 
 ```
 envs/op3_brace/
-├── __init__.py           # Package init, exports Op3BraceEnv
-├── env.py                # Core environment class
-├── op3.xml               # OP3 model (copy or reference from assets/)
-└── system_explanation.md # This document
+├── __init__.py                  # Package init, exports Op3BraceEnv
+├── env.py                       # Core environment class (Op3BraceEnv)
+├── op3.xml                      # OP3 model reference (or symlink from assets/)
+└── system_explanation.md        # This document
 ```
+
+**Note:** `op3_brace` is the full-body environment. For the arm-only variant, see `envs/op3_arm_brace_v2/`.
 
 ---
 
-## Differences from `brace_only_single`
+## Differences from `op3_arm_brace_v2` (Arm-Only Variant)
 
-| Aspect | 2D Humanoid Baseline | OP3 Brace |
+| Aspect | Full-Body (`op3_brace`) | Arm-Only (`op3_arm_brace_v2`) |
 |--------|---|---|
-| **Robot Model** | `humanoid_2d_half.xml` (5 DOF, 2D) | `op3.xml` (20 DOF, 3D) |
-| **Obs Dim** | 10 | 31 |
-| **Action Dim** | 5 | 12 |
-| **Obs Components** | COM height, knee/arm/forearm angles, velocities, contact flags | Body pose (R/P), angular velocity, 12 joint angles/velocities, contact flags |
-| **Contact Geoms** | Named left/right arms, head, torso, knees | OP3 collision meshes (head, arms, legs, body) |
-| **Fixed Joints** | None (all actuated) | Head pan/tilt, hip yaw, ankles |
-| **Reward** | Arm-first timing, arm sync, knee timing, head impact | *Idem* + torque penalty |
-| **Architecture** | Standalone script in `scripts/` | Env package in `envs/` for broader integration |
+| **Actuated DOF** | 12 (6 arms + 6 legs) | 6 (arms only) |
+| **Obs Dim** | 31 | 19 |
+| **Action Dim** | 12 | 6 |
+| **Obs Components** | Body pose, 12 joint angles/vels, 3 contact flags | Body pose, 6 arm angles/vels, 3 contact flags |
+| **Controlled Joints** | Shoulders, elbows, hips, knees | Shoulders, elbows only |
+| **Fixed Joints** | Head, ankles, hip yaw | Head, all leg joints, ankles, hip yaw |
+| **Push Force** | Fixed | 90 N (fixed) |
+| **Arm Contact Reward** | Component of larger contact reward | 5.0 (immediate, high priority) |
+| **Head Impact Penalty** | 5.0× | 10.0× (stricter) |
+| **Torque Penalty** | −(full sum of all 12) | −0.01×Στ (lighter, arm-only) |
+| **Jitter Penalty** | −(count of all 12) | −0.1×count (lighter, arm-only) |
+
+**Key Advantage of Full-Body:** Enables more sophisticated bracing strategies with coordinated leg stabilization, better generalization to varied push directions and magnitudes.
 
 ---
 
