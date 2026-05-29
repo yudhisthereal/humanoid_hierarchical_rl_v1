@@ -24,6 +24,17 @@ class Op3BraceEnv:
      arms_contact, head_contact, feet_contact]
 
     Action (12): normalized in [-1, 1], mapped to arm + leg joint targets.
+    
+    REWARD WEIGHTS (SINGLE SOURCE OF TRUTH):
+    =========================================
+    r_arm_first:        5.0  (Primary: arms contacting before head)
+    r_arm_sync:         1.0  (Secondary: both arms contact together)
+    r_knee_timing:      1.0  (Tertiary: knees contact after arms)
+    c_head_impact:    100.0  (Catastrophic: head contact = episode failure)
+    c_torque:           0.2  (Efficiency: penalize high joint torques)
+    c_jitter:           0.2  (Smoothness: penalize action sign flips)
+    torso_pitch:       10.0  (Stability: penalize leaning beyond 17deg)
+    success_bonus:    100.0  (Success: only at episode termination)
     """
 
     ARM_ACTUATORS = [
@@ -62,11 +73,11 @@ class Op3BraceEnv:
         "r_knee",
     ]
 
-    # Arm control limits (unchanged)
+    # Arm control limits
     ARM_CTRL_MIN = np.array([-1.7, -1.0, -1.0, -1.7, -1.0, -1.0], dtype=np.float32)
     ARM_CTRL_MAX = np.array([1.7, 1.0, 1.0, 1.7, 1.0, 1.0], dtype=np.float32)
 
-    # Leg control limits (as provided)
+    # Leg control limits
     LEG_CTRL_MIN = np.array([-0.5, -1.0, 0.0, 0.0, 0.0, -1.57], dtype=np.float32)
     LEG_CTRL_MAX = np.array([0.0, 0.0, 1.57, 0.5, 1.0, 0.0], dtype=np.float32)
 
@@ -108,7 +119,7 @@ class Op3BraceEnv:
         self.frame_skip = 5
         self.dt = float(self.model.opt.timestep) * float(self.frame_skip)
 
-        self.action_dim = 12  # 6 arms + 6 legs
+        self.action_dim = 12
         self.obs_dim = 31
 
         self.obs_clip = 50.0
@@ -193,26 +204,20 @@ class Op3BraceEnv:
 
     def _collect_geom_ids(self, names: list[str]) -> set[int]:
         out: set[int] = set()
-        # First try resolving by geom name (explicit name attribute)
         for name in names:
             gid = int(mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name))
             if gid >= 0:
                 out.add(gid)
 
-        # If none found, fallback: parse the XML and match geom elements whose `mesh` attribute
-        # equals one of the requested names.
         if not out:
             try:
                 import xml.etree.ElementTree as ET
-
                 tree = ET.parse(self.xml_path)
                 root = tree.getroot()
                 mesh_names: list[str] = []
-                # collect all geom elements in document order
                 for geom in root.findall(".//geom"):
                     mesh_attr = geom.get("mesh")
                     name_attr = geom.get("name")
-                    # prefer mesh attribute; fall back to name attribute
                     mesh_names.append(mesh_attr if mesh_attr is not None else (name_attr if name_attr is not None else ""))
 
                 n = min(len(mesh_names), int(self.model.ngeom))
@@ -220,7 +225,6 @@ class Op3BraceEnv:
                     if mesh_names[i] in names:
                         out.add(i)
             except Exception:
-                # XML parsing fallback failed; continue to raise below
                 out = set()
 
         if not out:
@@ -246,10 +250,7 @@ class Op3BraceEnv:
         a = np.nan_to_num(np.asarray(action_unit, dtype=np.float32), nan=0.0, posinf=1.0, neginf=-1.0)
         a = np.clip(a, -1.0, 1.0)
         
-        # Map first 6 actions to arms
         arm_ctrl = self.ARM_CTRL_MIN + 0.5 * (a[:6] + 1.0) * (self.ARM_CTRL_MAX - self.ARM_CTRL_MIN)
-        
-        # Map last 6 actions to legs
         leg_ctrl = self.LEG_CTRL_MIN + 0.5 * (a[6:12] + 1.0) * (self.LEG_CTRL_MAX - self.LEG_CTRL_MIN)
         
         return np.concatenate([arm_ctrl, leg_ctrl])
@@ -271,9 +272,6 @@ class Op3BraceEnv:
             self.t_arms_r = t
         if np.isinf(self.t_head) and self._has_floor_contact(self.head_geom_ids):
             self.t_head = t
-
-    def _head_min_z(self) -> float:
-        return float(min(float(self.data.geom_xpos[gid, 2]) for gid in self.head_geom_ids))
 
     def _get_obs(self) -> np.ndarray:
         quat = np.asarray(self.data.xquat[self.body_id], dtype=np.float64)
@@ -303,69 +301,126 @@ class Op3BraceEnv:
     def _apply_controls(self, all_ctrl: np.ndarray) -> None:
         ctrl = np.array(self.data.ctrl, copy=True)
         
-        # Apply arm and leg controls
         for i, aid in enumerate(self.all_actuator_ids):
             lo = float(self.model.actuator_ctrlrange[aid, 0])
             hi = float(self.model.actuator_ctrlrange[aid, 1])
             ctrl[aid] = float(np.clip(float(all_ctrl[i]), lo, hi))
 
-        # Apply fixed controls
         for aid, target in zip(self.fixed_actuator_ids, self.fixed_targets):
             ctrl[aid] = float(target)
 
         self.data.ctrl[:] = ctrl
 
-    def _compute_reward(self, action: np.ndarray, success: bool, done: bool) -> tuple[float, dict[str, float]]:
-        # Reward for arms making contact (arm-first strategy)
+    def _compute_reward(self, action: np.ndarray, success: bool, done: bool, pitch: float) -> tuple[float, dict[str, float]]:
+        """
+        REWARD COMPUTATION - WEIGHTS ARE APPLIED HERE (SINGLE SOURCE OF TRUTH)
+        
+        Raw components (logged for analysis):
+        - r_arm_first_raw:  arms contact timing [0, 1]
+        - r_arm_sync_raw:   arm synchronization [0, 1]
+        - r_knee_timing_raw: knee timing [0, 1]
+        - c_head_impact_raw: 1 if head contact, else 0 (binary)
+        - c_torque_raw:     sum of absolute joint torques (capped at 50 offset)
+        - c_jitter_raw:     number of action sign flips
+        - torso_pitch_raw:  radians of lean beyond 17deg [0, inf)
+        - success_raw:      1 if success, else 0
+        
+        Weighted contributions (what actually affects reward):
+        - r_arm_first:      5.0 * r_arm_first_raw
+        - r_arm_sync:       1.0 * r_arm_sync_raw
+        - r_knee_timing:    1.0 * r_knee_timing_raw
+        - c_head_impact:   -100.0 * c_head_impact_raw (episode ends immediately)
+        - c_torque:         -0.2 * c_torque_raw
+        - c_jitter:         -0.2 * c_jitter_raw
+        - torso_pitch:     -10.0 * torso_pitch_raw
+        - success_bonus:   +100.0 if success and done else 0
+        """
+        
+        # ===== RAW COMPONENT CALCULATIONS =====
+        
+        # R1: Arm-first strategy (raw: 0 to 1)
         arms_contacted = not np.isinf(self.t_arms_l) and not np.isinf(self.t_arms_r)
         t_arms_min = min(self.t_arms_l, self.t_arms_r)
-        r_arm_first = float(np.tanh(max(self.t_head - t_arms_min, 0.0) / 1.0)) if arms_contacted else 0.0
+        r_arm_first_raw = float(np.tanh(max(self.t_head - t_arms_min, 0.0) / 1.0)) if arms_contacted else 0.0
         
-        # Bonus for synchronized arm contact
+        # R2: Arm synchronization (raw: 0 to 1)
         if arms_contacted:
-            r_arm_sync = 1.0 - float(np.tanh(abs(self.t_arms_l - self.t_arms_r)))
+            r_arm_sync_raw = 1.0 - float(np.tanh(abs(self.t_arms_l - self.t_arms_r)))
         else:
-            r_arm_sync = 0.0
+            r_arm_sync_raw = 0.0
         
-        # Penalty for early knee contact
+        # R3: Knee timing (raw: 0 to 1)
         legs_contacted = self._has_floor_contact(self.leg_geom_ids)
-        if legs_contacted:
-            r_knee_timing = 1.0 - float(np.tanh(abs(max(self.t_head - t_arms_min, 0.0)) / 0.2))
+        if legs_contacted and arms_contacted:
+            r_knee_timing_raw = 1.0 - float(np.tanh(abs(max(self.t_head - t_arms_min, 0.0)) / 0.2))
         else:
-            r_knee_timing = 0.0
+            r_knee_timing_raw = 0.0
         
-        # Penalty for head contact (should never touch)
-        head_z = self._head_min_z()
-        c_head_impact = max(0.0, 0.15 - head_z) * 5.0
+        # C1: Head impact (raw: 0 or 1)
+        head_contact = self._has_floor_contact(self.head_geom_ids)
+        c_head_impact_raw = 1.0 if head_contact else 0.0
         
-        # Penalize extreme torques (encourage energy efficiency)
+        # C2: Torque cost (raw: sum of torques, capped at 50 offset)
         torque_sum = float(np.sum(np.abs(np.asarray(self.data.actuator_force[self.all_actuator_ids], dtype=np.float32))))
-        r_torque = -torque_sum
+        c_torque_raw = max(0.0, torque_sum - 50.0)
         
-        # Penalize action jitter (encourage smooth motion)
+        # C3: Torso pitch penalty (raw: radians beyond 0.3 rad threshold)
+        torso_pitch_raw = max(0.0, abs(pitch) - 0.3) * 10.0  # Multiplied by 10 here for raw value
+        
+        # C4: Action jitter (raw: count of sign flips)
         prev = np.asarray(self.prev_action, dtype=np.float32)
         curr = np.asarray(action, dtype=np.float32)
         mask = (np.abs(prev) >= 0.5) & (np.abs(curr) >= 0.5) & (np.sign(prev) != np.sign(curr))
-        n_jitter = int(np.sum(mask))
-        r_jitter = -float(n_jitter)
+        c_jitter_raw = float(np.sum(mask))
         
-        # Compose reward
-        reward = 1.0 * r_arm_first + 0.8 * r_arm_sync + 1.0 * r_knee_timing - c_head_impact + 0.5 * r_torque + 0.5 * r_jitter
+        # Success bonus (raw: 0 or 1)
+        success_raw = 1.0 if (done and success) else 0.0
         
-        # Success bonus
-        if done and success:
-            reward += 100.0
-
+        # ===== WEIGHTED REWARD COMPUTATION (SINGLE SOURCE OF TRUTH) =====
+        # Weights are applied HERE, not in the tracker
+        WEIGHT_ARM_FIRST = 5.0
+        WEIGHT_ARM_SYNC = 1.0
+        WEIGHT_KNEE_TIMING = 1.0
+        WEIGHT_HEAD_IMPACT = 100.0  # Catastrophic penalty
+        WEIGHT_TORQUE = 0.2
+        WEIGHT_JITTER = 0.2
+        WEIGHT_TORSO_PITCH = 10.0
+        WEIGHT_SUCCESS_BONUS = 100.0
+        
+        reward = (WEIGHT_ARM_FIRST * r_arm_first_raw +
+                  WEIGHT_ARM_SYNC * r_arm_sync_raw +
+                  WEIGHT_KNEE_TIMING * r_knee_timing_raw)
+        
+        reward -= (WEIGHT_HEAD_IMPACT * c_head_impact_raw +
+                   WEIGHT_TORQUE * c_torque_raw +
+                   WEIGHT_JITTER * c_jitter_raw +
+                   WEIGHT_TORSO_PITCH * torso_pitch_raw)
+        
+        reward += WEIGHT_SUCCESS_BONUS * success_raw
+        
+        # Clip final reward
         reward = float(np.clip(np.nan_to_num(reward, nan=0.0), -self.reward_clip, self.reward_clip))
-
+        
+        # Return reward and RAW components for logging (tracker will NOT apply weights)
         return reward, {
-            "r_arm_first": float(r_arm_first),
-            "r_arm_sync": float(r_arm_sync),
-            "r_knee_timing": float(r_knee_timing),
-            "r_torque": float(r_torque),
-            "r_jitter": float(r_jitter),
-            "c_head_impact": float(c_head_impact),
-            "success_bonus": 100.0 if (done and success) else 0.0,
+            # Raw components (what the tracker will log)
+            "r_arm_first_raw": r_arm_first_raw,
+            "r_arm_sync_raw": r_arm_sync_raw,
+            "r_knee_timing_raw": r_knee_timing_raw,
+            "c_head_impact_raw": c_head_impact_raw,
+            "c_torque_raw": c_torque_raw,
+            "c_jitter_raw": c_jitter_raw,
+            "torso_pitch_raw": torso_pitch_raw,
+            "success_raw": success_raw,
+            # Weighted contributions (for debugging, but tracker won't use these)
+            "r_arm_first_weighted": WEIGHT_ARM_FIRST * r_arm_first_raw,
+            "r_arm_sync_weighted": WEIGHT_ARM_SYNC * r_arm_sync_raw,
+            "r_knee_timing_weighted": WEIGHT_KNEE_TIMING * r_knee_timing_raw,
+            "c_head_impact_weighted": -WEIGHT_HEAD_IMPACT * c_head_impact_raw,
+            "c_torque_weighted": -WEIGHT_TORQUE * c_torque_raw,
+            "c_jitter_weighted": -WEIGHT_JITTER * c_jitter_raw,
+            "torso_pitch_weighted": -WEIGHT_TORSO_PITCH * torso_pitch_raw,
+            "success_bonus_weighted": WEIGHT_SUCCESS_BONUS * success_raw,
         }
 
     def reset(self) -> np.ndarray:
@@ -380,13 +435,9 @@ class Op3BraceEnv:
         self.t_arms_r = float("inf")
         self.t_head = float("inf")
 
-        # Keep robot slightly above floor at start
         self.data.qpos[2] += 0.05
-
-        # Apply fixed controls and neutral arm/leg targets
         self._apply_controls(np.zeros(self.action_dim, dtype=np.float32))
 
-        # Simulate the push phase before the policy gets control.
         if hasattr(self.data, "xfrc_applied"):
             self.data.xfrc_applied[:] = 0.0
         push_impulse = float(self.push_force) * (self.dt * self.push_kick_scale)
@@ -402,7 +453,6 @@ class Op3BraceEnv:
         if hasattr(self.data, "xfrc_applied"):
             self.data.xfrc_applied[:] = 0.0
 
-        # Reset timing after the push so success/reward only reflect recovery.
         self.t_arms_l = float("inf")
         self.t_arms_r = float("inf")
         self.t_head = float("inf")
@@ -439,7 +489,11 @@ class Op3BraceEnv:
         )
 
         done = bool(head_contact or timeout or invalid_state)
-        reward, parts = self._compute_reward(action=action, success=bool(success), done=done)
+        
+        quat = np.asarray(self.data.xquat[self.body_id], dtype=np.float64)
+        _, pitch, _ = self._quat_to_roll_pitch_yaw(quat)
+        
+        reward, parts = self._compute_reward(action=action, success=bool(success), done=done, pitch=pitch)
 
         self.last_success = bool(success and done)
         self.done = done

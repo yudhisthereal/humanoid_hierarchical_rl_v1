@@ -288,26 +288,37 @@ class Op3ArmBraceEnv:
         else:
             r_arm_sync = 0.0
         
-        # Penalty for head contact (should never touch)
-        head_z = self._head_min_z()
-        c_head_impact = max(0.0, 0.15 - head_z) * 10.0  # Stronger penalty
+        # Head impact: use MuJoCo contact detection and contact forces (contact-array-based)
+        head_contact = False
+        contact_force = 0.0
+        for i in range(int(self.data.ncon)):
+            c = self.data.contact[i]
+            g1 = int(c.geom1)
+            g2 = int(c.geom2)
+            if (g1 == self.floor_geom_id and g2 in self.head_geom_ids) or (g2 == self.floor_geom_id and g1 in self.head_geom_ids):
+                head_contact = True
+                contact_force = max(contact_force, float(np.linalg.norm(c.frame[0:3])))
+        if head_contact:
+            # Apply fixed failure penalty: subtract 100 from reward when head contacts floor
+            c_head_impact = 100.0
+        else:
+            c_head_impact = 0.0
         
         # Survival bonus for each step without head contact
         r_survival = 0.01 if not self._has_floor_contact(self.head_geom_ids) else 0.0
         
-        # Penalize extreme torques (encourage energy efficiency)
+        # Torque cost (positive) and jitter cost (positive); they are subtracted from reward
         torque_sum = float(np.sum(np.abs(np.asarray(self.data.actuator_force[self.arm_actuator_ids], dtype=np.float32))))
-        r_torque = -0.01 * torque_sum
-        
-        # Penalize action jitter (encourage smooth motion)
+        c_torque = 0.01 * float(torque_sum)
+
         prev = np.asarray(self.prev_action, dtype=np.float32)
         curr = np.asarray(action, dtype=np.float32)
         mask = (np.abs(prev) >= 0.5) & (np.abs(curr) >= 0.5) & (np.sign(prev) != np.sign(curr))
         n_jitter = int(np.sum(mask))
-        r_jitter = -0.1 * float(n_jitter)
-        
-        # Compose reward
-        reward = r_arms_contact + 0.8 * r_arm_sync - c_head_impact + r_survival + r_torque + r_jitter
+        c_jitter = 0.1 * float(n_jitter)
+
+        # Compose reward (subtract positive costs)
+        reward = 5.0 * r_arms_contact + 1.0 * r_arm_sync - c_head_impact + r_survival - 0.5 * c_torque - 0.5 * c_jitter
         
         # Success bonus
         if done and success:
@@ -319,8 +330,8 @@ class Op3ArmBraceEnv:
             "r_arms_contact": float(r_arms_contact),
             "r_arm_sync": float(r_arm_sync),
             "r_survival": float(r_survival),
-            "r_torque": float(r_torque),
-            "r_jitter": float(r_jitter),
+            "c_torque": float(c_torque),
+            "c_jitter": float(c_jitter),
             "c_head_impact": float(c_head_impact),
             "success_bonus": 100.0 if (done and success) else 0.0,
         }

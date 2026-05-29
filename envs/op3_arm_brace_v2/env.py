@@ -102,6 +102,7 @@ class Op3ArmBraceEnv:
         self.push_force = 90.0
         self.push_steps = 5
         self.push_kick_scale = 0.02
+        self.push_steps_left = 0
 
         self.prev_action = np.zeros(self.action_dim, dtype=np.float32)
         self.done = False
@@ -339,30 +340,12 @@ class Op3ArmBraceEnv:
         # Keep robot slightly above floor at start
         self.data.qpos[2] += 0.05
 
+        # Initial push
+        self.push_steps_left = int(self.push_steps)
+        self.data.qvel[self.root_dof_adr + 0] += float(self.push_force) * (self.dt * self.push_kick_scale)
+
         # Apply fixed controls and neutral arm targets
         self._apply_controls(np.zeros(self.action_dim, dtype=np.float32))
-
-        # Simulate the push phase before the policy gets control.
-        # The policy only sees the post-push state returned from reset().
-        if hasattr(self.data, "xfrc_applied"):
-            self.data.xfrc_applied[:] = 0.0
-        push_impulse = float(self.push_force) * (self.dt * self.push_kick_scale)
-        self.data.qvel[self.root_dof_adr + 0] += push_impulse
-        for _ in range(int(self.push_steps)):
-            if hasattr(self.data, "xfrc_applied"):
-                self.data.xfrc_applied[:] = 0.0
-                self.data.xfrc_applied[self.body_id, 0] = float(self.push_force)
-            self._apply_controls(np.zeros(self.action_dim, dtype=np.float32))
-            for _ in range(self.frame_skip):
-                mujoco.mj_step(self.model, self.data)
-
-        if hasattr(self.data, "xfrc_applied"):
-            self.data.xfrc_applied[:] = 0.0
-
-        # Reset timing after the push so success/reward only reflect recovery.
-        self.t_arms_l = float("inf")
-        self.t_arms_r = float("inf")
-        self.t_head = float("inf")
 
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs()
@@ -376,6 +359,12 @@ class Op3ArmBraceEnv:
 
         arm_ctrl = self.map_action_to_ctrl(action)
         self._apply_controls(arm_ctrl)
+
+        # Push disturbance for first few steps
+        self.data.xfrc_applied[:] = 0.0
+        if self.push_steps_left > 0:
+            self.data.xfrc_applied[self.body_id, 0] = float(self.push_force)
+            self.data.qvel[self.root_dof_adr + 0] += float(self.push_force) * (self.dt * self.push_kick_scale)
 
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
@@ -401,6 +390,7 @@ class Op3ArmBraceEnv:
         self.last_success = bool(success and done)
         self.done = done
         self.step_count += 1
+        self.push_steps_left = max(0, self.push_steps_left - 1)
         self.prev_action = action.copy()
 
         info = {

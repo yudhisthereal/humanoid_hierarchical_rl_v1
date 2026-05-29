@@ -156,7 +156,7 @@ $$R_{arm\_first} = \tanh\left(\frac{\max(t_H - t_A^{min}, 0)}{1.0}\right)$$
 
 where $t_A^{min} = \min(t_A^L, t_A^R)$ and $t_H$ is head contact time (from MuJoCo array). If no arms contact, $R_{arm\_first} = 0$.
 
-**Weight:** $w_{arm\_first} = 1.0$ (highest priority)
+**Weight:** $w_{arm\_first} = 5.0$ (Primary objective)
 
 ### 2. Arm Synchronization Reward ($R_{arm\_sync}$)
 
@@ -166,7 +166,7 @@ $$R_{arm\_sync} = 1.0 - \tanh(|t_A^L - t_A^R|)$$
 
 Evaluated only if both arms have contacted; else $R_{arm\_sync} = 0$.
 
-**Weight:** $w_{arm\_sync} = 0.8$
+**Weight:** $w_{arm\_sync} = 1.0$ (Secondary objective)
 
 ### 3. Knee Timing Reward ($R_{knee\_timing}$)
 
@@ -180,36 +180,38 @@ where $t_K$ is first knee contact time from MuJoCo array. Evaluated if knees con
 
 ### 4. Head Impact Penalty ($C_{head\_impact}$)
 
-Per-step penalty on head height to discourage proximity to floor:
+Per-step penalty based on actual MuJoCo contact forces when any head geom contacts the floor. This uses the MuJoCo contact array rather than a height heuristic.
 
-$$C_{head\_impact} = \max(0.0, 0.15 - z_{head}) \times 5.0$$
+Compute per-contact force magnitude from the contact frame vectors reported by MuJoCo (example implementation uses `c.frame[0:3]` for force components). Then scale and cap each contact contribution:
 
-where $z_{head}$ is the minimum Z-coordinate across all head geoms.
+$$C_{head\_impact} = \sum_{i\in\mathcal{C}_{head}} \min\big(20.0,\; 2.0 \cdot \|f_i\|\big)$$
 
-**Weight:** −1.0 (penalty)
+where $\mathcal{C}_{head}$ is the set of head–floor contacts at the current step and $f_i$ is the contact frame force vector for contact $i$. The scaling factor (2.0) and cap (20.0) reflect implementation choices to keep the per-step penalty bounded.
 
-### 5. Torque Load Penalty ($R_{torque}$)
+**Interpretation:** This is an actual contact-force-based penalty (higher when head hits harder). In the implementation head contact also immediately terminates the episode (failure), so this term reinforces the hard constraint during intermediate steps.
 
-Per-step penalty on cumulative actuation effort to encourage energy-efficient bracing:
+### 5. Torque Load Cost ($C_{torque}$)
 
-$$R_{torque} = -\sum_{j=0}^{11} |\tau_j|$$
+Per-step positive cost on cumulative actuation effort to encourage energy-efficient bracing:
 
-where $\tau_j = \text{data.actuator\_force}[j]$ is the actuator force/torque of actuator $j$.
+$$C_{torque} = \sum_{j=0}^{11} |\tau_j|$$
 
-**Weight:** $w_{torque} = 0.5$
+where $\tau_j = \text{data.actuator\_force}[j]$ is the actuator force/torque of actuator $j$. This value is treated as a cost (non-negative) and subtracted from the reward via its weight.
 
-### 6. Jitter Penalty ($R_{jitter}$)
+**Weight:** $w_{torque} = 0.2$ (tertiary - efficiency improvement)
 
-Per-step penalty on action sign-flips to encourage smooth, coherent movement:
+### 6. Jitter Cost ($C_{jitter}$)
 
-$$R_{jitter} = -n_{jitter}$$
+Per-step positive count-based cost on action sign-flips to encourage smooth, coherent movement:
+
+$$C_{jitter} = n_{jitter}$$
 
 where $n_{jitter}$ is the count of actuators experiencing sign-flip jitter:
 - For each of the 12 actuators, check if the normalized action value changed sign between consecutive steps.
 - **Condition for jitter:** $|\text{action}_{t-1}[j]| \geq 0.5$ AND $|\text{action}_{t}[j]| \geq 0.5$ AND $\text{sign}(\text{action}_{t-1}[j]) \neq \text{sign}(\text{action}_{t}[j])$
 - $n_{jitter} \in [0, 12]$.
 
-**Weight:** $w_{jitter} = 0.5$
+**Weight:** $w_{jitter} = 0.2$ (tertiary - smooth motion)
 
 ### 7. Success Bonus
 
@@ -217,23 +219,32 @@ Applied **only at episode termination** if success criteria are met:
 
 $$R_{success} = 100.0 \text{ if episode succeeds, else } 0.0$$
 
+
 ### Total Per-Step Reward
 
-$$R_t = w_{arm\_first} \cdot R_{arm\_first} + w_{arm\_sync} \cdot R_{arm\_sync} + w_{knee\_timing} \cdot R_{knee\_timing} - C_{head\_impact} + w_{torque} \cdot R_{torque} + w_{jitter} \cdot R_{jitter}$$
+Per-step reward combines positive objective terms and subtracts cost terms:
+
+$$
+R_t = w_{arm\_first} R_{arm\_first} + w_{arm\_sync} R_{arm\_sync} + w_{knee\_timing} R_{knee\_timing} - w_{head\_impact} C_{head\_impact} - w_{torque} C_{torque} - w_{jitter} C_{jitter} + R_{success}
+$$
+
+Where $w_{head\_impact}$ controls how strongly contact forces on the head reduce reward (implementation treats head contact as immediate termination, so this term reinforces safety before termination). Typical weights used in the codebase: $w_{arm\_first}=5.0$, $w_{arm\_sync}=1.0$, $w_{knee\_timing}=1.0$, $w_{torque}=0.2$, $w_{jitter}=0.2$.
 
 **Clipping:** Final per-step reward is clipped to [−100, +100].
+
+**Note (recorded value):** The scalar value returned by `env.step()` is the per-step reward $R_t$ computed above (the weighted sum of positive objectives minus positive costs), plus any immediate success bonus applied at termination. Training scripts in `scripts/` additionally record the raw per-component values each step and append a `step_reward` entry (the `env.step()` return). The per-component visualizer (`scripts/reward_component_tracker.py`) uses these recorded values so it can display both the raw component contributions and the actual `step_reward` for direct comparison.
 
 **Component Priority:**
 
 | Component | Weight | Priority | Intuition |
 |-----------|--------|----------|-----------|
-| $R_{arm\_first}$ | 1.0 | **1st (Highest)** | Arm-first contact is the core defensive task. |
-| $R_{arm\_sync}$ | 0.8 | **1st+** | Synchronized arms maximize bracing effectiveness. |
-| $R_{knee\_timing}$ | 1.0 | **1st+ (Equal)** | Timely knee contact supports the bracing strategy. |
-| $R_{torque}$ | 0.5 | **2nd** | Energy efficiency is secondary; encourage controlled bracing. |
-| $R_{jitter}$ | 0.5 | **2nd (Equal)** | Smooth movement prevents oscillation and jerky behavior. |
-| $C_{head\_impact}$ | −5.0 | **Hard constraint** | Head height penalty; head should not touch floor. |
-| $R_{success}$ | 100.0 | **Episode bonus** | Final reward applies only at termination if all criteria met. |
+| $R_{arm\_first}$ | 5.0 | **PRIMARY** | Arm-first contact is the core defensive task objective. |
+| $R_{arm\_sync}$ | 1.0 | **SECONDARY** | Synchronized arms maximize bracing effectiveness. |
+| $R_{knee\_timing}$ | 1.0 | **SECONDARY** | Timely knee contact supports the bracing strategy. |
+| $C_{torque}$ | 0.2 | **TERTIARY** | Energy efficiency encourages controlled bracing. |
+| $C_{jitter}$ | 0.2 | **TERTIARY** | Smooth movement prevents oscillation and jerky behavior. |
+| $C_{head\_impact}$ | (scaled) | **HARD CONSTRAINT** | Head contact penalized by actual contact force; head must never touch. |
+| $R_{success}$ | 100.0 | **EPISODE BONUS** | Final reward applied only at termination if all criteria met. |
 
 ---
 

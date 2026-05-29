@@ -130,81 +130,80 @@ All hyperparameters are inherited from the brace_only_single baseline to ensure 
 
 ## Reward Function
 
-Per-step reward is computed as a combination of contact-sequence reward, torque penalty, jitter penalty, and a success bonus applied at episode end.
+Per-step reward is composed from arm-first objectives and explicit, positive costs that are subtracted from the reward. All contact timing and head-impact detection must use MuJoCo's contact array.
 
-### 1. Contact Sequence Reward ($R_{contact}$)
+### 1. Arm-First Contact Reward ($R_{arm\_first}$)
 
-Encourages arms to contact the floor first (before head), with synchronized left/right arm impact. **All contact timing based on MuJoCo contact array detection.**
+Reward for arms contacting before head (primary objective):
 
-$$R_{contact} = w_1 \cdot r_{arm\_first} + w_2 \cdot r_{arm\_sync} - c_{head\_impact}$$
+$$R_{arm\_first} = \tanh\left(\frac{\max(t_H - t_A^{min}, 0)}{1.0}\right)$$
 
-**Terms:**
+where $t_A^{min} = \min(t_A^L, t_A^R)$ and $t_H$ is head contact time (MuJoCo contact array). If no arms contact, $R_{arm\_first}=0$.
 
-- **$r_{arm\_first}$** (weight $w_1 = 1.0$):  
-  If at least one arm has made ground contact (detected via MuJoCo contact array):
-  $$r_{arm\_first} = \tanh\left(\frac{\max(t_H - t_{arms}^{min}, 0)}{1.0}\right)$$
-  where $t_{arms}^{min} = \min(t_A^L, t_A^R)$ (first arm contact time from MuJoCo array) and $t_H$ is head contact time (from MuJoCo array). If no arms contact, $r_{arm\_first} = 0$.
+**Weight:** $w_{arm\_first} = 5.0$ (PRIMARY objective)
 
-- **$r_{arm\_sync}$** (weight $w_2 = 0.8$):  
-  Reward for synchronized left/right arm contact (both detected via MuJoCo contact array):
-  $$r_{arm\_sync} = 1.0 - \tanh(|t_A^L - t_A^R|)$$
-  where $t_A^L$ and $t_A^R$ are first contact times for left and right arms from the MuJoCo contact array. Evaluated only if both arms contact; else $r_{arm\_sync} = 0$.
+### 2. Arm Synchronization Reward ($R_{arm\_sync}$)
 
-- **$c_{head\_impact}$** (per-step penalty):  
-  $$c_{head\_impact} = \max(0, 0.15 - z_{head}) \times 5.0$$
-  Penalizes low head position to discourage head-ground proximity. (Soft penalty; hard termination occurs only if MuJoCo detects actual head-ground contact.)
+Bonus for synchronized left/right arm contact (evaluated only if both arms contacted):
 
-### 2. Torque Load Penalty ($R_{torque}$)
+$$R_{arm\_sync} = 1.0 - \tanh(|t_A^L - t_A^R|)$$
 
-Per-step penalty on cumulative joint actuation effort to encourage energy-efficient bracing.
+**Weight:** $w_{arm\_sync} = 1.0$ (SECONDARY objective)
 
-$$R_{torque} = -\sum_{j=1}^{6} |\tau_j|$$
+### 3. Head Impact Cost ($C_{head\_impact}$)
 
-where:
-- $\tau_j$ = actuator force/effort of arm joint $j$, computed via `data.actuator_force[actuator_id]`
-- Summed over all 6 actuated arm joints per step (NOT normalized; raw effort sum)
+Use MuJoCo contact forces for head–floor contacts (contact-array-based). Per-step head cost is the sum over head–floor contacts of a scaled, capped force magnitude:
 
-### 3. Jitter Penalty ($R_{jitter}$)
+$$C_{head\_impact} = \sum_{i\in\mathcal{C}_{head}} \min\big(20.0,\; 2.0\,\|f_i\|\big)$$
 
-Per-step penalty on action sign-flips to encourage smooth, coherent movement.
+This is a positive cost and is subtracted from the reward; actual head contact also terminates the episode (failure).
 
-$$R_{jitter} = -n_{jitter}$$
+### 4. Torque Cost ($C_{torque}$)
 
-where $n_{jitter}$ is the count of actuators experiencing sign-flip jitter:
-- For each of the 6 arm actuators, check if the normalized action value changed sign between consecutive steps.
-- **Condition for jitter:** $|\text{action}_{t-1}[j]| \geq 0.5$ AND $|\text{action}_{t}[j]| \geq 0.5$ AND $\text{sign}(\text{action}_{t-1}[j]) \neq \text{sign}(\text{action}_{t}[j])$
-- Count the number of actuators satisfying this condition; $n_{jitter} \in [0, 6]$.
+Positive per-step cost based on actuator effort (sum of absolute actuator forces), scaled in code. This cost is subtracted from the reward.
 
-### 4. Success Bonus
+Example implementation (in code):
 
-Applied **only at episode termination** if success criteria are met:
+```text
+C_{torque} = 0.01 * \sum_{j=1}^{6} |\tau_j|
+```
 
-$$R_{success} = \begin{cases} +100.0 & \text{if episode succeeds} \\ 0.0 & \text{otherwise} \end{cases}$$
+**Weight:** $w_{torque} = 0.5$ (tertiary)
 
-### Total Reward Function
+### 5. Jitter Cost ($C_{jitter}$)
 
-**Per-step reward (before success bonus):**
+Positive per-step count-based cost for action sign-flips (encourages smoothness). Example in code:
 
-$$R_t = w_{contact} \cdot R_{contact}(t) + w_{torque} \cdot R_{torque}(t) + w_{jitter} \cdot R_{jitter}(t)$$
+```text
+C_{jitter} = 0.1 * n_{jitter}
+```
 
-**At episode termination:**
+where $n_{jitter}$ is the number of actuators that flip sign while both previous and current magnitudes ≥ 0.5.
 
-$$R_{final} = R_{success}$$
+**Weight:** $w_{jitter} = 0.5$ (tertiary)
 
-**Combined episode-step reward:**
+### Success Bonus
 
-$$R_{\text{total}} = \sum_{t=1}^{T} R_t + R_{final}$$
+At episode termination if success criteria met:
 
-where $T$ is the episode length (≤ 200 steps) and weights are:
+$$R_{success} = 100.0$$
 
-| Component | Weight | Priority | Intuition |
-|-----------|--------|----------|-----------|
-| $R_{contact}$ | $w_{contact} = 10.0$ | **1st (Highest)** | Arm-first contact is the core task objective. |
-| $R_{torque}$ | $w_{torque} = 0.5$ | **2nd** | Energy efficiency is secondary; encourage controlled, low-effort bracing. |
-| $R_{jitter}$ | $w_{jitter} = 0.5$ | **2nd (Equal)** | Smooth movement prevents oscillation and jerky behavior; equal to torque. |
-| $R_{success}$ | — | **Bonus** | Episode-level success bonus applied only if all success criteria met. |
+### Total Per-Step Reward
+
+Per-step reward (before success bonus):
+
+$$
+R_t = w_{arm\_first} R_{arm\_first} + w_{arm\_sync} R_{arm\_sync}
+\quad - \; w_{head\_impact} C_{head\_impact}
+\quad - \; w_{torque} C_{torque}
+\quad - \; w_{jitter} C_{jitter}
+$$
+
+Typical weights used in the code: $w_{arm\_first}=5.0$, $w_{arm\_sync}=1.0$, $w_{head\_impact}=1.0$, $w_{torque}=0.5$, $w_{jitter}=0.5$.
 
 **Clipping:** Final per-step reward is clipped to [−100, +100].
+
+**Note (recorded value):** The scalar value returned by `env.step()` is the per-step reward $R_t$ computed above (the weighted sum of positive objectives minus positive costs), plus any immediate success bonus applied at termination. Training scripts in `scripts/` additionally record the raw per-component values each step and append a `step_reward` entry (the `env.step()` return). The per-component visualizer (`scripts/reward_component_tracker.py`) consumes these recorded values so it can display both raw component contributions and the actual `step_reward` for direct comparison.
 
 ---
 

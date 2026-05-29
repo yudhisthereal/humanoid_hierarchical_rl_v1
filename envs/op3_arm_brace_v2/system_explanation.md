@@ -4,7 +4,7 @@
 - 2026-05-19: Default `head_tilt` changed from -1.0 to 0.0 (level).
 - 2026-05-19: Reward shaping updated: immediate arm-contact reward, survival bonus for avoiding head contact, stricter arm-sync tolerance, and tuned torque/jitter penalties.
 - 2026-05-19: Training fixes applied (PPONetwork outputs now tanh-squashed; sampling/log-prob corrected; PPO old_log_probs bug fixed).
-
+- 2026-05-21: Push applied during reset (before episode starts), not during episode steps.
 
 ## Overview
 
@@ -105,8 +105,6 @@ Learned Parameters:
 
 ## Training Hyperparameters
 
-All hyperparameters are inherited from the brace_only_single baseline to ensure consistency.
-
 | Category | Parameter | Value |
 |----------|-----------|-------|
 | **Optimization** | Learning rate | 3e−4 (Adam) |
@@ -132,79 +130,103 @@ All hyperparameters are inherited from the brace_only_single baseline to ensure 
 
 Per-step reward is computed as a combination of contact-sequence reward, torque penalty, jitter penalty, and a success bonus applied at episode end.
 
-### 1. Contact Sequence Reward ($R_{contact}$)
+### 1. Arm Contact Reward ($r_{arms\_contact}$)
 
-Encourages arms to contact the floor first (before head), with synchronized left/right arm impact. **All contact timing based on MuJoCo contact array detection.**
+Encourages both arms to make contact with the ground:
 
-$$R_{contact} = w_1 \cdot r_{arm\_first} + w_2 \cdot r_{arm\_sync} - c_{head\_impact}$$
+$$r_{arms\_contact} = \begin{cases} 5.0 & \text{if both arms have contacted floor} \\ 0 & \text{otherwise} \end{cases}$$
 
-**Terms:**
+Contact detection uses MuJoCo contact array (actual geometric collision with floor geom).
 
-- **$r_{arm\_first}$** (weight $w_1 = 1.0$):  
-  If at least one arm has made ground contact (detected via MuJoCo contact array):
-  $$r_{arm\_first} = \tanh\left(\frac{\max(t_H - t_{arms}^{min}, 0)}{1.0}\right)$$
-  where $t_{arms}^{min} = \min(t_A^L, t_A^R)$ (first arm contact time from MuJoCo array) and $t_H$ is head contact time (from MuJoCo array). If no arms contact, $r_{arm\_first} = 0$.
+### 2. Arm Synchronization Reward ($r_{arm\_sync}$)
 
-- **$r_{arm\_sync}$** (weight $w_2 = 0.8$):  
-  Reward for synchronized left/right arm contact (both detected via MuJoCo contact array):
-  $$r_{arm\_sync} = 1.0 - \tanh(|t_A^L - t_A^R|)$$
-  where $t_A^L$ and $t_A^R$ are first contact times for left and right arms from the MuJoCo contact array. Evaluated only if both arms contact; else $r_{arm\_sync} = 0$.
+Rewards synchronized left/right arm contact when both arms have contacted:
 
-- **$c_{head\_impact}$** (per-step penalty):  
-  $$c_{head\_impact} = \max(0, 0.15 - z_{head}) \times 5.0$$
-  Penalizes low head position to discourage head-ground proximity. (Soft penalty; hard termination occurs only if MuJoCo detects actual head-ground contact.)
+$$r_{arm\_sync} = 1.0 - \tanh\left(\frac{|t_{arms\_left} - t_{arms\_right}|}{0.2}\right)$$
 
-### 2. Torque Load Penalty ($R_{torque}$)
+where $t_{arms\_left}$ and $t_{arms\_right}$ are first contact times from MuJoCo contact array.
 
-Per-step penalty on cumulative joint actuation effort to encourage energy-efficient bracing.
+- Returns 0 if not both arms have contacted
+- Stricter sync tolerance (0.2 denominator) encourages near-simultaneous contact
 
-$$R_{torque} = -\sum_{j=1}^{6} |\tau_j|$$
+**Weight in total reward:** $1.0$
 
-where:
-- $\tau_j$ = actuator force/effort of arm joint $j$, computed via `data.actuator_force[actuator_id]`
-- Summed over all 6 actuated arm joints per step (NOT normalized; raw effort sum)
+### 3. Head Impact Penalty ($c_{head\_impact}$)
 
-### 3. Jitter Penalty ($R_{jitter}$)
+Binary penalty applied when head makes actual contact with floor:
 
-Per-step penalty on action sign-flips to encourage smooth, coherent movement.
+$$c_{head\_impact} = \begin{cases} 100.0 & \text{if head contacts floor (MuJoCo contact)} \\ 0 & \text{otherwise} \end{cases}$$
 
-$$R_{jitter} = -n_{jitter}$$
+**Note:** Contact detection uses MuJoCo contact array. Head contact also triggers immediate episode termination.
 
-where $n_{jitter}$ is the count of actuators experiencing sign-flip jitter:
-- For each of the 6 arm actuators, check if the normalized action value changed sign between consecutive steps.
-- **Condition for jitter:** $|\text{action}_{t-1}[j]| \geq 0.5$ AND $|\text{action}_{t}[j]| \geq 0.5$ AND $\text{sign}(\text{action}_{t-1}[j]) \neq \text{sign}(\text{action}_{t}[j])$
-- Count the number of actuators satisfying this condition; $n_{jitter} \in [0, 6]$.
+### 4. Survival Bonus ($r_{survival}$)
 
-### 4. Success Bonus
+Small positive reward per step for keeping head off the ground:
 
-Applied **only at episode termination** if success criteria are met:
+$$r_{survival} = \begin{cases} 0.01 & \text{if no head contact} \\ 0 & \text{if head contact} \end{cases}$$
 
-$$R_{success} = \begin{cases} +100.0 & \text{if episode succeeds} \\ 0.0 & \text{otherwise} \end{cases}$$
+Encourages the robot to keep its head up.
 
-### Total Reward Function
+### 5. Torque Cost ($c_{torque}$)
 
-**Per-step reward (before success bonus):**
+Positive penalty for high actuator effort:
 
-$$R_t = w_{contact} \cdot R_{contact}(t) + w_{torque} \cdot R_{torque}(t) + w_{jitter} \cdot R_{jitter}(t)$$
+$$c_{torque} = 0.01 \times \sum_{j=1}^{6} |\tau_j|$$
 
-**At episode termination:**
+where $\tau_j$ is the actuator force for arm joint $j$ (`data.actuator_force[actuator_id]`).
 
-$$R_{final} = R_{success}$$
+This cost is **subtracted** from the reward.
 
-**Combined episode-step reward:**
+### 6. Jitter Cost ($c_{jitter}$)
 
-$$R_{\text{total}} = \sum_{t=1}^{T} R_t + R_{final}$$
+Penalty for action sign-flips that indicate oscillatory behavior:
 
-where $T$ is the episode length (≤ 200 steps) and weights are:
+$$c_{jitter} = 0.1 \times n_{jitter}$$
 
-| Component | Weight | Priority | Intuition |
-|-----------|--------|----------|-----------|
-| $R_{contact}$ | $w_{contact} = 10.0$ | **1st (Highest)** | Arm-first contact is the core task objective. |
-| $R_{torque}$ | $w_{torque} = 0.5$ | **2nd** | Energy efficiency is secondary; encourage controlled, low-effort bracing. |
-| $R_{jitter}$ | $w_{jitter} = 0.5$ | **2nd (Equal)** | Smooth movement prevents oscillation and jerky behavior; equal to torque. |
-| $R_{success}$ | — | **Bonus** | Episode-level success bonus applied only if all success criteria met. |
+where $n_{jitter}$ is the count of actuators (0-6) satisfying:
+- Previous action magnitude ≥ 0.5
+- Current action magnitude ≥ 0.5  
+- Sign(prev) ≠ Sign(curr)
 
-**Clipping:** Final per-step reward is clipped to [−100, +100].
+This cost is **subtracted** from the reward.
+
+## Reward Function
+
+### Total Per-Step Reward Formula
+
+$$R_t = r_{\text{arms\_contact}} + r_{\text{arm\_sync}} - c_{\text{head\_impact}} + r_{\text{survival}} - c_{\text{torque}} - c_{\text{jitter}}$$
+
+**Success Bonus (added at episode termination only):**
+
+$$R_{\text{success}} = \begin{cases} 100.0 & \text{if } done = \text{True and } success = \text{True} \\ 0 & \text{otherwise} \end{cases}$$
+
+**Final reward returned by `step()`:**
+
+$$\text{reward} = \text{clip}(R_t + R_{\text{success}}, -100.0, 100.0)$$
+
+### Reward Components
+
+| Component | Symbol | Weight | Description |
+|-----------|--------|--------|-------------|
+| Arm Contact | `r_arms_contact` | 5.0 | Reward given when both arms have made contact with the floor. Contact is detected via MuJoCo contact array (actual geometric collision with floor geom). Once both arms have contacted, this reward is given on every subsequent step of the episode. |
+| Arm Synchronization | `r_arm_sync` | 1.0 | Reward for near-simultaneous arm contact. Calculated as $1.0 - \tanh(\lvert t_L - t_R \rvert / 0.2)$ where $t_L$ and $t_R$ are the first contact times from the MuJoCo contact array. Only applies after both arms have contacted the floor. The denominator of 0.2 creates a stricter synchronization requirement, heavily rewarding contacts within ~0.2 seconds of each other. |
+| Head Impact Penalty | `c_head_impact` | 100.0 | Penalty applied when the head makes contact with the floor. Contact is detected via MuJoCo contact array. This penalty is applied on the step where head contact occurs, and the episode also terminates immediately with success = False. |
+| Survival Bonus | `r_survival` | 0.01 | Small positive reward given on each step where the head is NOT in contact with the floor. Encourages the robot to keep its head elevated throughout the episode. |
+| Torque Penalty | `c_torque` | 0.01 | Penalty for high actuator effort. Calculated as $0.01 \times \sum_{j=1}^{6} \lvert \tau_j \rvert$ summed over the 6 actuated arm joints, where $\tau_j$ is the actuator force from `data.actuator_force`. Encourages energy-efficient bracing motions. |
+| Jitter Penalty | `c_jitter` | 0.1 | Penalty for action sign-flips that indicate oscillatory or unstable control. Calculated as $0.1 \times n_{\text{jitter}}$ where $n_{\text{jitter}}$ counts the number of actuators (0-6) satisfying: previous action magnitude $\geq 0.5$, current action magnitude $\geq 0.5$, and $\text{sign}(a_{t-1}) \neq \text{sign}(a_t)$. Encourages smooth, coherent arm movements. |
+| Success Bonus | `R_success` | 100.0 | One-time bonus applied only at episode termination when all success criteria are met. Success requires: head never touched floor during episode, both arms contacted floor, arms contacted before head, and arm contact times synchronized within 0.1 seconds. |
+
+### Component Return Values (via `info` dict)
+
+| Key | Description |
+|-----|-------------|
+| `r_arms_contact` | Arm contact reward value (5.0 or 0.0) |
+| `r_arm_sync` | Synchronization reward value (0.0 to 1.0) |
+| `r_survival` | Survival bonus value (0.01 or 0.0) |
+| `c_torque` | Torque penalty value (≥ 0.0) |
+| `c_jitter` | Jitter penalty value (≥ 0.0) |
+| `c_head_impact` | Head impact penalty value (100.0 or 0.0) |
+| `success_bonus` | Success bonus value (100.0 or 0.0, non-zero only at episode termination) |
 
 ---
 
@@ -229,11 +251,12 @@ Episode ends if **any** of the following occur:
 An episode is considered **successful** if **all** of the following hold at episode termination:
 
 1. **Head never touches ground** during the episode (no MuJoCo contact between head geoms and floor at any step).
-2. **Left arm contacts first:** $t_A^L < t_H$ (from MuJoCo array).
-3. **Right arm contacts first:** $t_A^R < t_H$ (from MuJoCo array).
-4. **Arms synchronized:** $|t_A^L - t_A^R| \leq 0.1$ seconds, where times are from actual contact detection.
+2. **Left arm contacted:** $t_{arms\_left}$ is finite (arm made contact).
+3. **Right arm contacted:** $t_{arms\_right}$ is finite (arm made contact).
+4. **Arms contact before head:** $t_{arms\_left} < t_{head}$ AND $t_{arms\_right} < t_{head}$.
+5. **Arms synchronized:** $|t_{arms\_left} - t_{arms\_right}| \leq 0.1$ seconds.
 
-(All contact timing is based on MuJoCo contact array detection only; no feet/knee contact requirements since legs are locked.)
+**Note:** Contact times are recorded only when actual MuJoCo contact is detected with the floor geom. No contact occurs before episode starts (contact timers are reset after push).
 
 ### Training Stopping Condition
 
@@ -247,16 +270,23 @@ Training halts early when:
 
 ### Episode Reset (`env.reset()`)
 
+The push is applied **during reset** before the policy receives the first observation. The policy only sees the post-push state.
+
+Reset sequence:
 1. Reset all joint positions and velocities to zero (via `mujoco.mj_resetData()`).
-2. Raise COM slightly (+0.05 m in Z) to avoid initial collision.
-3. Apply an initial push impulse:
-   - Fixed push force: **90.0 N** in +X direction (forward).
-   - Applied for 5 steps (~0.025 s) at episode start.
-4. Set fixed joints explicitly to zero (head pan/tilt, all hip/knee/ankle joints).
-5. Clear contact timers: $t_A^L, t_A^R, t_H \leftarrow \infty$.
+2. Raise COM slightly (+0.05 m in Z) to avoid initial floor penetration.
+3. Set fixed joints explicitly to zero (head pan/tilt, all hip/knee/ankle joints).
+4. **Apply push disturbance:**
+   - Forward force: **90.0 N** applied to body
+   - Forward velocity kick: `push_force * (dt * push_kick_scale)`
+   - Simulated for `push_steps = 5` steps (~0.025 seconds)
+5. Reset contact timers to infinity **after** push (so only recovery phase counts for success).
+6. Return initial observation (19-dim).
+
+**Key:** No push is applied during `step()` calls. The push is entirely contained within `reset()`.
 
 ### Reset Returns
-- Initial observation (19-dim).
+- Initial observation (19-dim) from post-push state.
 
 ---
 
@@ -283,7 +313,7 @@ For each step:
 2. Get contact pair: `c = data.contact[i]; geom1 = int(c.geom1); geom2 = int(c.geom2)`
 3. Determine if floor is involved: `floor_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, 'floor'))`
 4. Check limb membership: if `geom1 == floor_id` and `geom2` in arm/head set, record contact time for that limb. (Or vice versa for `geom2 == floor_id`.)
-5. Record first contact time for each limb; ignore subsequent contacts.
+5. Record **first** contact time for each limb; ignore subsequent contacts.
 
 **No position-based estimation:** Contact is only registered when MuJoCo's contact solver detects a collision.
 
@@ -307,7 +337,6 @@ OP3 uses position-servo actuators. Each actuator is a proportional controller ta
 ### Actuator Force / Torque
 - `data.actuator_force[actuator_id]` gives the scalar force applied by the actuator at current step.
 - For position servo: $\text{force} = k_p \cdot (\text{target} - \text{current\_pos})$ (simplified).
-- Used for torque penalty: penalizes high actuation effort.
 
 ### Clipping & Bounds
 - Observations clipped to [−50, +50].
@@ -321,7 +350,7 @@ OP3 uses position-servo actuators. Each actuator is a proportional controller ta
 ```
 envs/op3_arm_brace_v2/
 ├── __init__.py           # Package init, exports Op3ArmBraceEnv
-├── env.py                # Core environment class
+├── env.py                # Core environment class (this file)
 ├── op3.xml               # OP3 model (copy or reference from assets/)
 └── system_explanation.md # This document
 ```
@@ -330,7 +359,7 @@ envs/op3_arm_brace_v2/
 
 ## Differences from `op3_brace`
 
-| Aspect | OP3 Brace (Full) | OP3 Arm Brace |
+| Aspect | OP3 Brace (Full) | OP3 Arm Brace (v2) |
 |--------|---|---|
 | **Actuated Joints** | 12 (6 arms + 6 legs) | 6 (arms only) |
 | **Action Dim** | 12 | 6 |
@@ -338,8 +367,9 @@ envs/op3_arm_brace_v2/
 | **Obs Components** | Body pose (R/P), angular velocity, 12 joint angles/vels, contact flags | Body pose (R/P), angular velocity, 6 arm angles/vels, contact flags |
 | **Fixed Joints** | Head, hip yaw, ankles | Head, all legs (hip yaw, pitch, roll, knee, ankle) |
 | **Contact Reward** | Arm-first, arm-sync, knee timing | Arm-first, arm-sync only (no leg contact) |
-| **Success Condition** | Arms first + arm sync + no head touch | Arms first + arm sync + no head touch |
+| **Success Condition** | Arms first + arm sync + no head touch + knees? | Arms first + arm sync + no head touch |
 | **Task Difficulty** | Robot can use legs to stabilize | Arms only; more difficult; pure upper-body bracing |
+| **Push Timing** | During reset only | During reset only |
 
 ---
 
@@ -351,6 +381,8 @@ Before training:
 - [ ] Observation shape = 19; no NaN/Inf during reset.
 - [ ] Action space maps cleanly to 6 arm control targets.
 - [ ] Contact detection logic identifies floor collisions correctly.
+- [ ] Push is applied during reset, not during steps.
+- [ ] Contact timers reset after push (t_arms_l/r/t_head = inf after reset).
 - [ ] First episode runs for 200 steps without crashes.
 - [ ] Reward components compute without NaN.
 - [ ] Success flag evaluates correctly after episode.
